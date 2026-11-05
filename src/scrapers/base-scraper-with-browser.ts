@@ -2,6 +2,7 @@ import puppeteer, { type Frame, type Page, type PuppeteerLifeCycleEvent } from '
 import { ScraperProgressTypes } from '../definitions';
 import { getDebug } from '../helpers/debug';
 import { clickButton, fillInput, waitUntilElementFound } from '../helpers/elements-interactions';
+import { redactUrl } from '../helpers/fetch';
 import { getCurrentUrl, waitForNavigation } from '../helpers/navigation';
 import { BaseScraper } from './base-scraper';
 import { ScraperErrorTypes } from './errors';
@@ -132,7 +133,7 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
     });
 
     this.page.on('requestfailed', request => {
-      debug('Request failed: %s %s', request.failure()?.errorText, request.url());
+      debug('Request failed: %s %s', request.failure()?.errorText, redactUrl(request.url()));
     });
   }
 
