@@ -26,6 +26,7 @@
     "build:types": "tsc --emitDeclarationOnly",
     "build:js": "babel src --out-dir lib --extensions \".ts\" --source-maps inline --verbose",
     "postbuild": "rimraf lib/tests",
+    "prepare": "npm run clean && npm run build:types && npm run build:js && rimraf lib/tests",
     "prepare:core": "git reset --hard && node utils/prepare-israeli-bank-scrapers-core.js && npm i --package-lock-only && npm ci && npm run lint:fix && npm run build",
     "prepare:default": "git reset --hard && npm ci && npm run build",
     "reset": "git reset --hard && npm ci"
