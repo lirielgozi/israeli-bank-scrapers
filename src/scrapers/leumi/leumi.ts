@@ -2,7 +2,7 @@ import moment, { type Moment } from 'moment';
 import { type Page } from 'puppeteer';
 import { SHEKEL_CURRENCY } from '../../constants';
 import { getDebug } from '../../helpers/debug';
-import { clickButton, fillInput, pageEvalAll, waitUntilElementFound } from '../../helpers/elements-interactions';
+import { clickButton, fillInput, waitUntilElementFound } from '../../helpers/elements-interactions';
 import { fetchGetWithinPage } from '../../helpers/fetch';
 import { getRawTransaction } from '../../helpers/transactions';
 import { waitForNavigation } from '../../helpers/navigation';
@@ -20,7 +20,8 @@ const SAVINGS_URL = `${BASE_URL}/uiapiproxy/v1/digital-retails/mobile/accounts/1
 
 const DATE_FORMAT = 'DD.MM.YY';
 const ACCOUNT_BLOCKED_MSG = 'המנוי חסום';
-const INVALID_PASSWORD_MSG = 'אחד או יותר מפרטי ההזדהות שמסרת שגויים. ניתן לנסות שוב';
+// Stable prefix shared by the old and redesigned login error notices.
+const INVALID_PASSWORD_MSG = 'אחד או יותר מפרטי ההזדהות';
 const CHANGE_PASSWORD_MODAL_SELECTOR = 'form input[name="newPwd"]';
 
 interface SavingsDepositItem {
@@ -62,29 +63,25 @@ interface SavingsAccountData {
 function getPossibleLoginResults() {
   const urls: LoginOptions['possibleResults'] = {
     [LoginResults.Success]: [/ebanking\/SO\/SPA.aspx/i],
+    [LoginResults.AccountBlocked]: [
+      async options => {
+        if (!options || !options.page) {
+          throw new Error('missing page options argument');
+        }
+        return options.page.evaluate(prefix => document.body?.innerText.includes(prefix) ?? false, ACCOUNT_BLOCKED_MSG);
+      },
+    ],
     [LoginResults.InvalidPassword]: [
       async options => {
         if (!options || !options.page) {
           throw new Error('missing page options argument');
         }
-        const errorMessage = await pageEvalAll(options.page, 'svg#Capa_1', '', element => {
-          return (element[0]?.parentElement?.children[1] as HTMLDivElement)?.innerText;
-        });
-
-        return errorMessage?.startsWith(INVALID_PASSWORD_MSG);
-      },
-    ],
-    [LoginResults.AccountBlocked]: [
-      // NOTICE - might not be relevant starting the Leumi re-design during 2022 Sep
-      async options => {
-        if (!options || !options.page) {
-          throw new Error('missing page options argument');
-        }
-        const errorMessage = await pageEvalAll(options.page, '.errHeader', '', label => {
-          return (label[0] as HTMLElement)?.innerText;
-        });
-
-        return errorMessage?.startsWith(ACCOUNT_BLOCKED_MSG);
+        // Return only a boolean from the renderer; never copy page text into
+        // Node, where library debug/error reporting could expose it.
+        return options.page.evaluate(
+          prefix => document.body?.innerText.includes(prefix) ?? false,
+          INVALID_PASSWORD_MSG,
+        );
       },
     ],
     [LoginResults.ChangePassword]: [
@@ -330,7 +327,14 @@ async function waitForPostLogin(page: Page): Promise<void> {
   await Promise.race([
     waitUntilElementFound(page, 'a[title="דלג לחשבון"]', true, 60000),
     waitUntilElementFound(page, 'div.main-content', false, 60000),
-    page.waitForSelector(`xpath//div[contains(string(),"${INVALID_PASSWORD_MSG}")]`),
+    // The old xpath//div queried /div (not //div), so it never matched.
+    // Use the same boolean predicate as result classification, with the same
+    // timeout as the other race branches so it cannot reject at 30 seconds.
+    page.waitForFunction(
+      prefixes => prefixes.some(prefix => document.body?.innerText.includes(prefix) ?? false),
+      { timeout: 60000 },
+      [INVALID_PASSWORD_MSG, ACCOUNT_BLOCKED_MSG],
+    ),
     waitUntilElementFound(page, CHANGE_PASSWORD_MODAL_SELECTOR, true, 60000),
   ]);
 }

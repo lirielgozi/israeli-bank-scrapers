@@ -9,10 +9,32 @@ function getJsonHeaders() {
   };
 }
 
+/**
+ * Returns the URL without its query string or fragment, so it is safe to put in an error or a log.
+ * Query strings can carry identifiers and tokens.
+ */
+export function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split(/[?#]/)[0];
+  }
+}
+
+/**
+ * Returns a JSON parse error message without the fragment of the response text that V8 quotes in it,
+ * since the response can hold account data.
+ */
+function describeParseError(e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e);
+  return message.replace(/"[\s\S]*"(\.\.\.)?/, '"<redacted>"');
+}
+
 function assertAutomationNotBlocked(status: number, responseText: string | null, url: string) {
   if (status === 429 || (responseText && /block automation|bot detection/i.test(responseText))) {
     throw new Error(
-      `Automation detected and blocked by server. Status: ${status}, URL: ${url}. The site is actively blocking automated access. Consider: 1) Using showBrowser:true, 2) Adding longer delays, 3) Using residential proxies, 4) Running at different times of day`,
+      `Automation detected and blocked by server. Status: ${status}, URL: ${redactUrl(url)}. The site is actively blocking automated access. Consider: 1) Using showBrowser:true, 2) Adding longer delays, 3) Using residential proxies, 4) Running at different times of day`,
     );
   }
 }
@@ -67,20 +89,24 @@ export async function fetchGetWithinPage<TResult>(
   url: string,
   ignoreErrors = false,
 ): Promise<TResult | null> {
-  const [result, status] = await page.evaluate(async innerUrl => {
-    let response: Response | undefined;
-    try {
-      response = await fetch(innerUrl, { credentials: 'include' });
-      if (response.status === 204) {
-        return [null, response.status] as const;
+  const [result, status] = await page.evaluate(
+    async (innerUrl: string, innerSafeUrl: string) => {
+      let response: Response | undefined;
+      try {
+        response = await fetch(innerUrl, { credentials: 'include' });
+        if (response.status === 204) {
+          return [null, response.status] as const;
+        }
+        return [await response.text(), response.status] as const;
+      } catch (e) {
+        throw new Error(
+          `fetchGetWithinPage error: ${e instanceof Error ? e.message : String(e)}, url: ${innerSafeUrl}, status: ${response?.status}`,
+        );
       }
-      return [await response.text(), response.status] as const;
-    } catch (e) {
-      throw new Error(
-        `fetchGetWithinPage error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${innerUrl}, status: ${response?.status}`,
-      );
-    }
-  }, url);
+    },
+    url,
+    redactUrl(url),
+  );
 
   if (!ignoreErrors) {
     assertAutomationNotBlocked(status, result, url);
@@ -92,7 +118,7 @@ export async function fetchGetWithinPage<TResult>(
     } catch (e) {
       if (!ignoreErrors) {
         throw new Error(
-          `fetchGetWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, result: ${result}, status: ${status}`,
+          `fetchGetWithinPage parse error: ${describeParseError(e)}, url: ${redactUrl(url)}, status: ${status}`,
         );
       }
     }
@@ -139,8 +165,10 @@ export async function fetchPostWithinPage<TResult>(
     }
   } catch (e) {
     if (!ignoreErrors) {
+      // Never include data, extraHeaders or resultText here: they can hold credentials, tokens and account data,
+      // and this message reaches result.errorMessage.
       throw new Error(
-        `fetchPostWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, data: ${JSON.stringify(data)}, extraHeaders: ${JSON.stringify(extraHeaders)}, result: ${resultText}`,
+        `fetchPostWithinPage parse error: ${describeParseError(e)}, url: ${redactUrl(url)}, status: ${status}`,
       );
     }
   }

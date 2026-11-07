@@ -578,7 +578,7 @@ class IsracardAmexBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCred
       };
       debug('user login started');
       const loginResult = await fetchPostWithinPage<{ status: string }>(this.page, loginUrl, request);
-      debug(`user login with status '${loginResult?.status}'`, loginResult);
+      debug(`user login with status '${loginResult?.status}'`);
 
       if (loginResult && loginResult.status === '1') {
         this.emitProgress(ScraperProgressTypes.LoginSuccess);
