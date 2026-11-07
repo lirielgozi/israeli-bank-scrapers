@@ -562,7 +562,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     xSiteId: string,
   ): Promise<TransactionsAccount> {
     debug('fetch frames (misgarot) for card %s', card.cardUniqueId);
-    const frames = await fetchPost<unknown>(
+    const frameResponse = await fetchPost<unknown>(
       FRAMES_REQUEST_ENDPOINT,
       { cardsForFrameData: [{ cardUniqueId: card.cardUniqueId }] },
       {
@@ -575,6 +575,11 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       throw new Error('CAL card metadata retrieval failed');
     });
 
+    // Observed provider response for a card without available frame data.
+    // It must not abort transaction collection or masquerade as confirmed absence.
+    const metadataUnavailable =
+      isRecord(frameResponse) && frameResponse.statusCode === 87 && frameResponse.result === null;
+    const frames = metadataUnavailable ? { result: {} } : frameResponse;
     if (!isValidFramesResponse(frames)) {
       throw new Error('CAL card metadata response is invalid');
     }
@@ -670,6 +675,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       balanceDate: balanceDate != null ? balanceDate : undefined,
       accountNumber: card.last4Digits,
       cardType,
+      cardMetadataStatus: metadataUnavailable ? 'unavailable' : 'available',
       // Group limits can be shared; no card-specific limit is established by this response.
     };
 

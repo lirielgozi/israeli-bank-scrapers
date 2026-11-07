@@ -254,6 +254,39 @@ describe('CAL synthetic card data', () => {
     await expect(scraper('2026-02-01', [cards[0]]).fetchData()).rejects.toThrow(/^CAL card metadata retrieval failed$/);
   });
 
+  test('observed status87/null frame envelope preserves transaction collection for all cards', async () => {
+    // Envelope observed from the live endpoint; all card IDs and amounts are synthetic.
+    const unavailableFrame = { statusCode: 87, result: null };
+    post.mockImplementation((endpoint, body) => {
+      if (endpoint.includes('GetFrameStatus'))
+        return Promise.resolve(
+          body.cardsForFrameData[0].cardUniqueId === cards[1].cardUniqueId
+            ? unavailableFrame
+            : {
+                statusCode: 1,
+                result: {
+                  bankIssuedCards: { cardLevelFrames: [{ cardUniqueId: cards[0].cardUniqueId, nextTotalDebit: 25 }] },
+                },
+              },
+        );
+      if (endpoint.includes('getClearanceRequests')) return Promise.resolve({ statusCode: 96 });
+      return Promise.resolve({ statusCode: 1, result: { bankAccounts: [] } });
+    });
+    const result = await scraper('2026-02-01').scrape({ username: 'synthetic', password: 'synthetic' });
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(cards.length);
+    expect(result.accounts?.[0]).toMatchObject({ balance: -25, cardMetadataStatus: 'available' });
+    expect(result.accounts?.[1]).toMatchObject({ cardMetadataStatus: 'unavailable', txns: [] });
+    expect(result.accounts?.[1].balance).toBeUndefined();
+    expect(result.accounts?.[1].cardFrame).toBeUndefined();
+    expect(
+      post.mock.calls.some(
+        ([endpoint, body]) =>
+          endpoint.includes('getCardTransactionsDetails') && body.cardUniqueId === cards[1].cardUniqueId,
+      ),
+    ).toBe(true);
+  });
+
   test('returns scraper failure without partial accounts when one card metadata response fails', async () => {
     post.mockImplementation((endpoint, body) => {
       if (endpoint.includes('GetFrameStatus')) {

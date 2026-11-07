@@ -3,6 +3,7 @@ export interface TransactionsAccount {
   balance?: number;
   balanceDate?: string;
   cardFrame?: number;
+  cardMetadataStatus?: 'available' | 'unavailable';
   cardType?: CardType;
   currency?: string;
   savingsAccount?: boolean;
