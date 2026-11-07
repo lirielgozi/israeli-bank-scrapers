@@ -6,6 +6,7 @@ import { fetchPost } from '../helpers/fetch';
 import { getCurrentUrl, waitForNavigation } from '../helpers/navigation';
 import { getFromSessionStorage } from '../helpers/storage';
 import { filterOldTransactions, getRawTransaction } from '../helpers/transactions';
+import { ScraperErrorTypes } from './errors';
 import { waitUntil } from '../helpers/waiting';
 import {
   CardType,
@@ -578,7 +579,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     // Observed provider response for a card without available frame data.
     // It must not abort transaction collection or masquerade as confirmed absence.
     const metadataUnavailable =
-      isRecord(frameResponse) && frameResponse.statusCode === 87 && frameResponse.result === null;
+      isRecord(frameResponse) && typeof frameResponse.statusCode === 'number' && frameResponse.statusCode !== 1;
     const frames = metadataUnavailable ? { result: {} } : frameResponse;
     if (!isValidFramesResponse(frames)) {
       throw new Error('CAL card metadata response is invalid');
@@ -702,9 +703,31 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const futureMonthsToScrape = this.options.futureMonthsToScrape ?? 1;
 
-    const accounts = await Promise.all(
-      cards.map(card => this.fetchCardData(card, startMoment, startDate, futureMonthsToScrape, Authorization, xSiteId)),
+    const warnings: NonNullable<ScraperScrapingResult['warnings']> = [];
+    const collected = await Promise.all(
+      cards.map(async card => {
+        try {
+          const account = await this.fetchCardData(
+            card,
+            startMoment,
+            startDate,
+            futureMonthsToScrape,
+            Authorization,
+            xSiteId,
+          );
+          if (account.cardMetadataStatus === 'unavailable')
+            warnings.push({ accountNumber: card.last4Digits, code: 'metadata-unavailable' });
+          return account;
+        } catch {
+          // Empty failed accounts would incorrectly reconcile away transactions.
+          warnings.push({ accountNumber: card.last4Digits, code: 'card-fetch-failed' });
+          return undefined;
+        }
+      }),
     );
+    const accounts = collected.filter((account): account is TransactionsAccount => account !== undefined);
+    if (cards.length > 0 && accounts.length === 0)
+      return { success: false, errorType: ScraperErrorTypes.General, warnings };
 
     debug('return the scraped accounts');
 
@@ -712,6 +735,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     return {
       success: true,
       accounts,
+      warnings,
     };
   }
 }

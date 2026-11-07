@@ -220,17 +220,16 @@ describe('CAL synthetic card data', () => {
     { result: null },
     { result: [] },
     { result: 'invalid' },
-    { statusCode: 0, result: {} },
-    { statusCode: 96, result: {}, title: 'Synthetic failure details' },
     { result: { bankIssuedCards: [] } },
     { result: { calIssuedCards: { cardLevelFrames: {} } } },
     { result: { bankIssuedCards: { cardLevelFrames: [null] } } },
     { result: { bankIssuedCards: { cardLevelFrames: [{ cardUniqueId: 'synthetic-a', nextTotalDebit: '12' }] } } },
-  ])('rejects failed or malformed metadata without returning partial success (%j)', async response => {
+  ])('isolates malformed metadata without returning an empty successful card (%j)', async response => {
     post.mockResolvedValue(response);
-    await expect(scraper('2026-02-01', [cards[0]]).fetchData()).rejects.toThrow(
-      /^CAL card metadata response is invalid$/,
-    );
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(false);
+    expect(result.accounts).toBeUndefined();
+    expect(result.warnings).toEqual([{ accountNumber: cards[0].last4Digits, code: 'card-fetch-failed' }]);
     expect(post).toHaveBeenCalledTimes(1);
   });
 
@@ -251,7 +250,10 @@ describe('CAL synthetic card data', () => {
 
   test('sanitizes metadata retrieval errors', async () => {
     post.mockRejectedValue(new Error('Synthetic private payload details'));
-    await expect(scraper('2026-02-01', [cards[0]]).fetchData()).rejects.toThrow(/^CAL card metadata retrieval failed$/);
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(false);
+    expect(result.warnings).toEqual([{ accountNumber: cards[0].last4Digits, code: 'card-fetch-failed' }]);
+    expect(JSON.stringify(result)).not.toContain('private payload');
   });
 
   test('observed status87/null frame envelope preserves transaction collection for all cards', async () => {
@@ -279,6 +281,7 @@ describe('CAL synthetic card data', () => {
     expect(result.accounts?.[1]).toMatchObject({ cardMetadataStatus: 'unavailable', txns: [] });
     expect(result.accounts?.[1].balance).toBeUndefined();
     expect(result.accounts?.[1].cardFrame).toBeUndefined();
+    expect(result.warnings).toEqual([{ accountNumber: cards[1].last4Digits, code: 'metadata-unavailable' }]);
     expect(
       post.mock.calls.some(
         ([endpoint, body]) =>
@@ -287,7 +290,7 @@ describe('CAL synthetic card data', () => {
     ).toBe(true);
   });
 
-  test('returns scraper failure without partial accounts when one card metadata response fails', async () => {
+  test('keeps other cards when one metadata response is malformed', async () => {
     post.mockImplementation((endpoint, body) => {
       if (endpoint.includes('GetFrameStatus')) {
         return Promise.resolve(
@@ -298,9 +301,48 @@ describe('CAL synthetic card data', () => {
       return Promise.resolve({ statusCode: 1, result: { bankAccounts: [] } });
     });
     const result = await scraper('2026-02-01').scrape({ username: 'synthetic', password: 'synthetic' });
-    expect(result.success).toBe(false);
-    expect(result.accounts).toBeUndefined();
-    expect(result.errorMessage).toBe('CAL card metadata response is invalid');
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(cards.length - 1);
+    expect(result.accounts?.some(a => a.accountNumber === cards[1].last4Digits)).toBe(false);
+    expect(result.warnings).toEqual([{ accountNumber: cards[1].last4Digits, code: 'card-fetch-failed' }]);
+  });
+
+  test.each([0, 96])(
+    'explicit non-success metadata status %i is unavailable, not a transaction failure',
+    async statusCode => {
+      post.mockImplementation(endpoint =>
+        Promise.resolve(
+          endpoint.includes('GetFrameStatus')
+            ? { statusCode, result: null }
+            : endpoint.includes('getClearanceRequests')
+              ? { statusCode: 96 }
+              : { statusCode: 1, result: { bankAccounts: [] } },
+        ),
+      );
+      const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+      expect(result.success).toBe(true);
+      expect(result.accounts?.[0].cardMetadataStatus).toBe('unavailable');
+      expect(result.warnings?.[0].code).toBe('metadata-unavailable');
+    },
+  );
+
+  test('a failed transaction request omits only that card instead of returning empty rows', async () => {
+    post.mockImplementation((endpoint, body) =>
+      Promise.resolve(
+        endpoint.includes('GetFrameStatus')
+          ? { statusCode: 1, result: {} }
+          : endpoint.includes('getClearanceRequests')
+            ? { statusCode: 96 }
+            : body.cardUniqueId === cards[1].cardUniqueId
+              ? { statusCode: 0 }
+              : { statusCode: 1, result: { bankAccounts: [] } },
+      ),
+    );
+    const result = await scraper('2026-02-01').fetchData();
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(cards.length - 1);
+    expect(result.accounts?.some(a => a.accountNumber === cards[1].last4Digits)).toBe(false);
+    expect(result.warnings).toEqual([{ accountNumber: cards[1].last4Digits, code: 'card-fetch-failed' }]);
   });
 
   test('accepts a successful metadata response with no matching card', async () => {
