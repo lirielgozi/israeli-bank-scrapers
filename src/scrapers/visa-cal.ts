@@ -172,8 +172,8 @@ interface CardPendingTransactionDetails extends CardTransactionDetailsError {
 
 interface CardLevelFrame {
   cardUniqueId: string;
-  nextTotalDebit?: number;
-  nextDebitDate?: string;
+  nextTotalDebit?: number | null;
+  nextDebitDate?: string | null;
 }
 
 interface IssuedCardsGroup {
@@ -181,14 +181,45 @@ interface IssuedCardsGroup {
   nextTotalDebitDateForAccount?: string | null;
   frameLimitForCardAmount?: number;
   fictiveMaxAccAmt?: number;
-  cardLevelFrames?: CardLevelFrame[];
+  cardLevelFrames?: CardLevelFrame[] | null;
 }
 
 interface FramesResponse {
+  statusCode?: number;
   result?: {
-    calIssuedCards?: IssuedCardsGroup;
-    bankIssuedCards?: IssuedCardsGroup;
+    calIssuedCards?: IssuedCardsGroup | null;
+    bankIssuedCards?: IssuedCardsGroup | null;
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isValidFramesResponse(value: unknown): value is FramesResponse {
+  if (!isRecord(value) || (value.statusCode !== undefined && value.statusCode !== 1) || !isRecord(value.result)) {
+    return false;
+  }
+
+  const { result } = value;
+  return ['calIssuedCards', 'bankIssuedCards'].every(key => {
+    const group = result[key];
+    if (group == null) return true;
+    if (!isRecord(group)) return false;
+    if (group.cardLevelFrames == null) return true;
+    return (
+      Array.isArray(group.cardLevelFrames) &&
+      group.cardLevelFrames.every(
+        frame =>
+          isRecord(frame) &&
+          typeof frame.cardUniqueId === 'string' &&
+          frame.cardUniqueId.trim().length > 0 &&
+          (frame.nextTotalDebit == null ||
+            (typeof frame.nextTotalDebit === 'number' && Number.isFinite(frame.nextTotalDebit))) &&
+          (frame.nextDebitDate == null || typeof frame.nextDebitDate === 'string'),
+      )
+    );
+  });
 }
 
 interface AuthModule {
@@ -531,7 +562,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     xSiteId: string,
   ): Promise<TransactionsAccount> {
     debug('fetch frames (misgarot) for card %s', card.cardUniqueId);
-    const frames = await fetchPost<FramesResponse>(
+    const frames = await fetchPost<unknown>(
       FRAMES_REQUEST_ENDPOINT,
       { cardsForFrameData: [{ cardUniqueId: card.cardUniqueId }] },
       {
@@ -540,9 +571,13 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         'Content-Type': 'application/json',
         ...apiHeaders,
       },
-    );
+    ).catch(() => {
+      throw new Error('CAL card metadata retrieval failed');
+    });
 
-    debug('frames response for card %s: %O', card.cardUniqueId, frames);
+    if (!isValidFramesResponse(frames)) {
+      throw new Error('CAL card metadata response is invalid');
+    }
 
     // Look for card-level frame in both calIssuedCards and bankIssuedCards
     const bankIssuedFrame = frames.result?.bankIssuedCards?.cardLevelFrames?.find(
@@ -642,8 +677,10 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
   }
 
   async fetchData(): Promise<ScraperScrapingResult> {
-    const defaultStartMoment = moment().subtract(1, 'years').subtract(6, 'months').add(1, 'day');
-    const startDate = this.options.startDate || defaultStartMoment.toDate();
+    const defaultStartMoment = moment().subtract(1, 'years').subtract(6, 'months').add(1, 'day').startOf('day');
+    const startDate = moment(this.options.startDate || defaultStartMoment)
+      .startOf('day')
+      .toDate();
     const startMoment = moment.max(defaultStartMoment, moment(startDate));
     debug(`fetch transactions starting ${startMoment.format()}`);
 
@@ -652,6 +689,10 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       this.getXSiteId(),
       this.getAuthorizationHeader(),
     ]);
+
+    if (new Set(cards.map(card => card.last4Digits)).size !== cards.length) {
+      throw new Error('CAL card suffixes are ambiguous');
+    }
 
     const futureMonthsToScrape = this.options.futureMonthsToScrape ?? 1;
 
