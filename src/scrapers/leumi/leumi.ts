@@ -323,8 +323,28 @@ async function navigateToLogin(page: Page): Promise<void> {
   ]);
 }
 
+// Executed in the renderer. A private URL alone is not a success signal:
+// require the visible account picker that fetchTransactions itself reads.
+// Return a boolean only, never account text or any page content.
+export function isPrivateAccountReady(): boolean {
+  if (
+    window.location.protocol !== 'https:' ||
+    window.location.hostname !== 'hb2.bankleumi.co.il' ||
+    window.location.pathname.toLowerCase() !== '/ebanking/so/spa.aspx'
+  )
+    return false;
+  if (document.querySelector('input[placeholder="שם משתמש"], input[placeholder="סיסמה"]')) return false;
+  if (document.body?.innerText.includes('אחד או יותר מפרטי ההזדהות') || document.body?.innerText.includes('המנוי חסום'))
+    return false;
+  const account = document.querySelector('app-masked-number-combo span.display-number-li');
+  return (
+    account !== null && account.getClientRects().length > 0 && window.getComputedStyle(account).visibility !== 'hidden'
+  );
+}
+
 async function waitForPostLogin(page: Page): Promise<void> {
   await Promise.race([
+    page.waitForFunction(isPrivateAccountReady, { timeout: 60000 }),
     waitUntilElementFound(page, 'a[title="דלג לחשבון"]', true, 60000),
     waitUntilElementFound(page, 'div.main-content', false, 60000),
     // The old xpath//div queried /div (not //div), so it never matched.

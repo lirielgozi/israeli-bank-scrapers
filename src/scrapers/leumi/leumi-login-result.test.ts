@@ -27,6 +27,7 @@ function fixture(bodyText?: string) {
   const waitForFunction = jest.fn(
     (fn: (prefix: string[]) => boolean, options: { timeout: number }, prefix: string[]) => {
       expect(options.timeout).toBe(60000);
+      if (prefix === undefined) return new Promise<boolean>(() => {});
       if (!renderer(fn, prefix, bodyText)) return Promise.reject(new Error('fixture: no known login state'));
       return Promise.resolve(true);
     },
@@ -54,7 +55,7 @@ describe('Leumi invalid-password result (offline)', () => {
     const f = fixture(`Login heading\n${message}\nfixture private data`);
     await expect(f.login.postAction()).resolves.toBeUndefined();
     await expect(f.classify()).resolves.toBe(true);
-    expect(f.waitForFunction).toHaveBeenCalledTimes(1);
+    expect(f.waitForFunction).toHaveBeenCalledTimes(2);
     expect(f.waitForSelector.mock.calls.every(call => !String(call[0]).includes('xpath'))).toBe(true);
     expect(await f.evaluate.mock.results[0].value).toBe(true);
   });
