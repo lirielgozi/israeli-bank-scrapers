@@ -223,22 +223,6 @@ function isCardPendingTransactionDetails(
   return (result as CardPendingTransactionDetails).result !== undefined;
 }
 
-function getBalanceAmount(frame: CardLevelFrame | undefined, accountGroup: IssuedCardsGroup | undefined) {
-  if (frame?.nextTotalDebit != null) {
-    return frame.nextTotalDebit;
-  }
-
-  if (accountGroup?.nextTotalDebitForAccount != null) {
-    return accountGroup.nextTotalDebitForAccount;
-  }
-
-  if (accountGroup?.frameLimitForCardAmount == null || accountGroup.fictiveMaxAccAmt == null) {
-    return undefined;
-  }
-
-  return accountGroup.frameLimitForCardAmount - accountGroup.fictiveMaxAccAmt;
-}
-
 async function getLoginFrame(page: Page) {
   let frame: Frame | null = null;
   debug('wait until login frame found');
@@ -570,34 +554,23 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     );
 
     let frame: CardLevelFrame | undefined;
-    let cardType: CardType = CardType.CompanyIssued;
-    let accountGroup: IssuedCardsGroup | undefined;
+    let cardType: CardType | undefined;
 
     if (bankIssuedFrame) {
       frame = bankIssuedFrame;
       cardType = CardType.BankIssued;
-      accountGroup = frames.result?.bankIssuedCards;
     } else if (calIssuedFrame) {
       frame = calIssuedFrame;
       cardType = CardType.CompanyIssued;
-      accountGroup = frames.result?.calIssuedCards;
-    } else if (frames.result?.bankIssuedCards) {
-      // No card-level frame found, but account has bankIssuedCards data
-      cardType = CardType.BankIssued;
-      accountGroup = frames.result.bankIssuedCards;
-    } else if (frames.result?.calIssuedCards) {
-      // No card-level frame found, but account has calIssuedCards data
-      cardType = CardType.CompanyIssued;
-      accountGroup = frames.result.calIssuedCards;
     }
 
     debug('searching for frame for card %s, found: %O', card.cardUniqueId, frame);
     debug('card type for card %s: %s', card.cardUniqueId, cardType);
 
-    const balanceDate: string | null | undefined = frame?.nextDebitDate ?? accountGroup?.nextTotalDebitDateForAccount;
+    const balanceDate: string | null | undefined = frame?.nextDebitDate;
 
-    const finalMonthToFetchMoment = moment().add(futureMonthsToScrape, 'month');
-    const months = finalMonthToFetchMoment.diff(startMoment, 'months');
+    const finalMonthToFetchMoment = moment().add(futureMonthsToScrape, 'month').startOf('month');
+    const months = finalMonthToFetchMoment.diff(startMoment.clone().startOf('month'), 'months');
     const allMonthsData: CardTransactionDetails[] = [];
 
     debug(`fetch pending transactions for card ${card.cardUniqueId}`);
@@ -654,7 +627,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         ? filterOldTransactions(transactions, moment(startDate), this.options.combineInstallments || false)
         : transactions;
 
-    const balanceAmount = getBalanceAmount(frame, accountGroup);
+    const balanceAmount = frame?.nextTotalDebit;
 
     const result: TransactionsAccount = {
       txns,
@@ -662,7 +635,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       balanceDate: balanceDate != null ? balanceDate : undefined,
       accountNumber: card.last4Digits,
       cardType,
-      cardFrame: accountGroup?.frameLimitForCardAmount,
+      // Group limits can be shared; no card-specific limit is established by this response.
     };
 
     return result;
