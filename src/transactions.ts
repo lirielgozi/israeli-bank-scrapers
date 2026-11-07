@@ -34,8 +34,22 @@ export interface BankCreditFacility {
   source: 'mizrahi-credit-modal' | 'leumi-credit-table';
 }
 
+// MAX homepage metadata is scoped to this card, not a CAL shared facility.
+export interface MaxCardPayment {
+  scope: 'card';
+  source: 'max-homepage';
+  sourceAsOf: string;
+  status: 'reported' | 'unavailable';
+  currency: 'ILS';
+  nextPayment: number | null;
+  nextPaymentDate: string | null;
+  isFinal: boolean | null;
+  configuredMonthlyPayment: number | null;
+}
+
 export interface TransactionsAccount {
   bankLoans?: BankLoanSnapshot;
+  maxCardPayment?: MaxCardPayment;
   calCard?: CalCardDetails;
   bankCreditFacility?: BankCreditFacility;
   accountNumber: string;
