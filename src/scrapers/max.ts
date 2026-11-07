@@ -13,7 +13,13 @@ import {
   getRawTransaction,
 } from '../helpers/transactions';
 import { sleep } from '../helpers/waiting';
-import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
+import {
+  TransactionStatuses,
+  TransactionTypes,
+  type Transaction,
+  type TransactionsAccount,
+  type MaxCardPayment,
+} from '../transactions';
 import {
   BaseScraperWithBrowser,
   LoginResults,
@@ -88,10 +94,41 @@ interface HomePageCard {
   Last4Digits: string;
   CreditLimit: number | null;
   OpenToBuy: number | null;
+  FixedDebit?: number | null;
   CycleSummary: Array<{
     Date: string;
     CurrencySymbol: string;
+    Currency?: number;
+    ActualDebitSum?: number | null;
+    IsFinnal?: boolean;
   }>;
+}
+
+// Observed on MAX's getHomePageData response, 2026-11-07. ActualDebitSum is
+// the card's next debit; TotalDebitSum is the cycle total before revolving
+// repayment. FixedDebit is the configured amount, not a fallback for a bill.
+export function getMaxCardPayment(card: HomePageCard | undefined, sourceAsOf: string): MaxCardPayment {
+  const entries = card?.CycleSummary?.filter(entry => entry.Currency === 376) ?? [];
+  const entry = entries.length === 1 ? entries[0] : undefined;
+  const amount = entry?.ActualDebitSum;
+  const validAmount = typeof amount === 'number' && Number.isFinite(amount) && amount >= 0;
+  const validDate =
+    typeof entry?.Date === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T/.test(entry.Date) &&
+    Number.isFinite(Date.parse(entry.Date));
+  const reported = validAmount && validDate;
+  const fixed = card?.FixedDebit;
+  return {
+    scope: 'card',
+    source: 'max-homepage',
+    sourceAsOf,
+    status: reported ? 'reported' : 'unavailable',
+    currency: 'ILS',
+    nextPayment: reported ? Math.round(amount * 100) / 100 : null,
+    nextPaymentDate: reported ? entry.Date.slice(0, 10) : null,
+    isFinal: reported && typeof entry.IsFinnal === 'boolean' ? entry.IsFinnal : null,
+    configuredMonthlyPayment: typeof fixed === 'number' && Number.isFinite(fixed) && fixed >= 0 ? fixed : null,
+  };
 }
 
 interface HomePageDataResult {
@@ -362,6 +399,7 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
 
   await loadCategories(page);
   const homePageCards = await loadHomePageData(page);
+  const homePageObservedAt = new Date().toISOString();
 
   let allResults: Record<string, Transaction[]> = {};
   for (let i = 0; i < allMonths.length; i += 1) {
@@ -380,7 +418,7 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
     allResults[accountNumber] = txns;
   });
 
-  return { allResults, homePageCards };
+  return { allResults, homePageCards, homePageObservedAt };
 }
 
 function getPossibleLoginResults(page: Page): PossibleLoginResults {
@@ -443,15 +481,18 @@ class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   }
 
   async fetchData() {
-    const { allResults, homePageCards } = await fetchTransactions(this.page, this.options);
-    const accounts: TransactionsAccount[] = Object.keys(allResults).map(accountNumber => {
+    const { allResults, homePageCards, homePageObservedAt } = await fetchTransactions(this.page, this.options);
+    // Metadata still refreshes for a card with no transactions in this window.
+    const accountNumbers = new Set([...Object.keys(allResults), ...homePageCards.keys()]);
+    const accounts: TransactionsAccount[] = [...accountNumbers].map(accountNumber => {
       const card = homePageCards.get(accountNumber);
       return {
         accountNumber,
-        txns: allResults[accountNumber],
+        txns: allResults[accountNumber] ?? [],
         balance: card ? getCardBalance(card) : undefined,
         balanceDate: card ? getCardBalanceDate(card) : undefined,
         cardFrame: card?.CreditLimit ?? undefined,
+        maxCardPayment: getMaxCardPayment(card, homePageObservedAt),
       };
     });
 
