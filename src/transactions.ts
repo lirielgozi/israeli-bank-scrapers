@@ -1,3 +1,5 @@
+import type { MizrahiProducts } from './mizrahi-products';
+
 export type BankLoanDetails =
   | { status: 'unavailable'; source: 'leumi-loan-detail' }
   | {
@@ -69,6 +71,8 @@ export interface MaxCardPayment {
 }
 
 export interface TransactionsAccount {
+  // Carrier only: this payload is NOT bound to accountNumber.
+  mizrahiProducts?: MizrahiProducts;
   bankLoans?: BankLoanSnapshot;
   maxCardPayment?: MaxCardPayment;
   calCard?: CalCardDetails;

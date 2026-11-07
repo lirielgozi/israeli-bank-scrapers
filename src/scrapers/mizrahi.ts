@@ -1,3 +1,4 @@
+import { readMizrahiProducts } from './mizrahi-products';
 import moment from 'moment';
 import { type Frame, type HTTPRequest, type Page } from 'puppeteer';
 import { SHEKEL_CURRENCY } from '../constants';
@@ -314,6 +315,9 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         await this.page.$eval(`${accountDropDownItemSelector}:nth-child(${i + 1})`, el => (el as HTMLElement).click());
         results.push(await this.fetchAccount());
       }
+
+      // Carrier only: products remain connection-scoped, never account-bound.
+      if (results.length) results[0].mizrahiProducts = await readMizrahiProducts(this.page);
 
       return {
         success: true,
