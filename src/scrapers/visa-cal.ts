@@ -1,3 +1,4 @@
+import { calCardDetails } from './visa-cal-metadata';
 import moment from 'moment';
 import { type HTTPRequest, type Frame, type Page } from 'puppeteer';
 import { getDebug } from '../helpers/debug';
@@ -474,7 +475,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     throw new Error('failed to open the password login tab');
   };
 
-  async getCards() {
+  async getCards(): Promise<InitResponse['result']['cards']> {
     const initData = await waitUntil(
       () => getFromSessionStorage<InitResponse>(this.page, 'init'),
       'get init data in session storage',
@@ -484,7 +485,15 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     if (!initData) {
       throw new Error('could not find "init" data in session storage');
     }
-    return initData?.result.cards.map(({ cardUniqueId, last4Digits }) => ({ cardUniqueId, last4Digits }));
+    return initData?.result.cards.map(
+      ({ cardUniqueId, last4Digits, isDebitCard, currentDebitDay, bankAccountUniqueId }) => ({
+        cardUniqueId,
+        last4Digits,
+        isDebitCard,
+        currentDebitDay,
+        bankAccountUniqueId,
+      }),
+    );
   }
 
   async getAuthorizationHeader() {
@@ -555,7 +564,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
   }
 
   private async fetchCardData(
-    card: { cardUniqueId: string; last4Digits: string },
+    card: { cardUniqueId: string; last4Digits: string; [key: string]: unknown },
     startMoment: moment.Moment,
     startDate: Date,
     futureMonthsToScrape: number,
@@ -676,6 +685,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       balanceDate: balanceDate != null ? balanceDate : undefined,
       accountNumber: card.last4Digits,
       cardType,
+      calCard: calCardDetails(card, frameResponse),
       cardMetadataStatus: metadataUnavailable ? 'unavailable' : 'available',
       // Group limits can be shared; no card-specific limit is established by this response.
     };
