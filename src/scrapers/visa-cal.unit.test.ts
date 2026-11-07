@@ -234,6 +234,21 @@ describe('CAL synthetic card data', () => {
     expect(post).toHaveBeenCalledTimes(1);
   });
 
+  test.each([
+    { calIssuedCards: null },
+    { bankIssuedCards: null },
+    { calIssuedCards: null, bankIssuedCards: null },
+    { calIssuedCards: { cardLevelFrames: null } },
+    { bankIssuedCards: { cardLevelFrames: null } },
+    { calIssuedCards: { cardLevelFrames: null }, bankIssuedCards: { cardLevelFrames: null } },
+  ])('accepts null optional groups or frame lists as absent (%j)', async frames => {
+    mockResponses(frames);
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(true);
+    expect(result.accounts?.[0]).toMatchObject({ balance: undefined, balanceDate: undefined, cardType: undefined });
+    expect(result.accounts?.[0].cardFrame).toBeUndefined();
+  });
+
   test('sanitizes metadata retrieval errors', async () => {
     post.mockRejectedValue(new Error('Synthetic private payload details'));
     await expect(scraper('2026-02-01', [cards[0]]).fetchData()).rejects.toThrow(/^CAL card metadata retrieval failed$/);

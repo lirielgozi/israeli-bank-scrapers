@@ -181,14 +181,14 @@ interface IssuedCardsGroup {
   nextTotalDebitDateForAccount?: string | null;
   frameLimitForCardAmount?: number;
   fictiveMaxAccAmt?: number;
-  cardLevelFrames?: CardLevelFrame[];
+  cardLevelFrames?: CardLevelFrame[] | null;
 }
 
 interface FramesResponse {
   statusCode?: number;
   result?: {
-    calIssuedCards?: IssuedCardsGroup;
-    bankIssuedCards?: IssuedCardsGroup;
+    calIssuedCards?: IssuedCardsGroup | null;
+    bankIssuedCards?: IssuedCardsGroup | null;
   };
 }
 
@@ -204,9 +204,9 @@ function isValidFramesResponse(value: unknown): value is FramesResponse {
   const { result } = value;
   return ['calIssuedCards', 'bankIssuedCards'].every(key => {
     const group = result[key];
-    if (group === undefined) return true;
+    if (group == null) return true;
     if (!isRecord(group)) return false;
-    if (group.cardLevelFrames === undefined) return true;
+    if (group.cardLevelFrames == null) return true;
     return (
       Array.isArray(group.cardLevelFrames) &&
       group.cardLevelFrames.every(
