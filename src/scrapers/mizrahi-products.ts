@@ -1,4 +1,4 @@
-import type { Page } from 'puppeteer';
+import type { Frame, Page } from 'puppeteer';
 import type { MizrahiDeposits, MizrahiMortgage, MizrahiProducts } from '../mizrahi-products';
 
 const clean = (s: string) => s.replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim();
@@ -90,12 +90,38 @@ async function navigate(page: Page, deposits: boolean): Promise<boolean> {
   await candidates[0].click();
   return true;
 }
+async function visibleFrame(frame: Frame): Promise<boolean> {
+  try {
+    for (let current: Frame | null = frame; current?.parentFrame(); current = current.parentFrame()) {
+      const element = await current.frameElement();
+      if (!element) return false;
+      try {
+        const visible = await element.evaluate(e => {
+          if (!e.isConnected || !e.getBoundingClientRect().width || !e.getBoundingClientRect().height) return false;
+          for (let ancestor: Element | null = e; ancestor; ancestor = ancestor.parentElement) {
+            const style = getComputedStyle(ancestor);
+            if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0) return false;
+          }
+          return true;
+        });
+        if (!visible) return false;
+      } finally {
+        await element.dispose();
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function readComponent(page: Page, deposits: boolean): Promise<MizrahiMortgage | MizrahiDeposits | null> {
   if (!(await navigate(page, deposits))) return null;
   const deadline = Date.now() + 8000;
   do {
     const values: Array<MizrahiMortgage | MizrahiDeposits> = [];
     for (const frame of page.frames()) {
+      // Child-document geometry does not reflect hidden embedding frames.
+      if (!(await visibleFrame(frame))) continue;
       const raw = await frame
         .evaluate(isDeposit => {
           const visible = (e: Element) =>
@@ -143,7 +169,7 @@ async function readComponent(page: Page, deposits: boolean): Promise<MizrahiMort
           return { activeFilter: text(filters[0]), fields };
         }, deposits)
         .catch(() => null);
-      if (!raw) continue;
+      if (!raw || !(await visibleFrame(frame))) continue;
       const value =
         'headers' in raw && raw.headers && raw.rows
           ? parseMizrahiMortgage(raw.headers, raw.rows)

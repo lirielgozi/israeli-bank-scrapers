@@ -13,5 +13,16 @@ try {
  const result=await readMizrahiProducts(page);
  assert.equal(result.mortgage?.tracks.length,6);assert.equal(result.deposits?.records.length,2);
  assert.equal(result.deposits.records[0].valuation,12356.78);assert.equal(result.mortgage.accountBinding,null);
+ await page.$eval('iframe',e=>e.style.visibility='hidden');
+ const hidden=await readMizrahiProducts(page);
+ assert.equal(hidden.mortgage,null);assert.equal(hidden.deposits,null);
+ await page.$eval('iframe',e=>e.style.visibility='visible');
+ await page.evaluate(html=>{const hidden=document.createElement('iframe');hidden.style.visibility='hidden';hidden.srcdoc=html;document.body.append(hidden);},mortgage+deposits);
+ const mixed=await readMizrahiProducts(page);
+ assert.equal(mixed.mortgage?.tracks.length,6);assert.equal(mixed.deposits?.records.length,2);
+ await page.$eval('iframe',e=>{const wrapper=document.createElement('div');wrapper.style.display='none';e.before(wrapper);wrapper.append(e);});
+ const ancestorHidden=await readMizrahiProducts(page);
+ assert.equal(ancestorHidden.mortgage,null);assert.equal(ancestorHidden.deposits,null);
+ console.log('PASS hidden frame/ancestor unavailable; visible frame selected beside conflicting hidden source');
  console.log('PASS synthetic browser: content-selected iframe, six tracks, two visible cards, hidden template ignored, precise valuation, no account binding');
 } finally {await browser.close();}
