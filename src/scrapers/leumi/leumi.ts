@@ -11,6 +11,8 @@ import { BaseScraperWithBrowser, LoginResults, type LoginOptions } from '../base
 import { type ScraperOptions, type ScraperScrapingResult } from '../interface';
 import { fetchForeignCurrencyAccounts } from './leumi-forex';
 
+import { readLeumiFacility, unavailableLeumiFacility } from './leumi-credit-facility';
+
 const debug = getDebug('leumi');
 const BASE_URL = 'https://hb2.bankleumi.co.il';
 const LOGIN_URL = 'https://www.leumi.co.il/he';
@@ -380,11 +382,27 @@ class LeumiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
     const startMoment = moment.max(minimumStartMoment, moment(startDate));
 
     const accounts = await fetchRegularAccounts(this, this.page, startMoment, this.options);
+    const checking = [...accounts];
     const savingsAccounts = await fetchSavingsAccounts(this.page, accounts);
     accounts.push(...savingsAccounts);
 
     const foreignCurrencyAccounts = await fetchForeignCurrencyAccounts(this.page, startMoment, this.options);
     accounts.push(...foreignCurrencyAccounts);
+
+    // Optional facility navigation runs only after all transaction collection.
+    // Session-selected account binding is validated only for a sole checking account.
+    if (checking.length === 1) {
+      try {
+        await this.page.goto(`${BASE_URL}/eBanking/SO/SPA.aspx#/ts/BusinessAccountTrx?WidgetPar=1`);
+        await this.page.waitForFunction(
+          () => [...document.querySelectorAll('a')].some(a => (a.textContent || '').trim() === 'פירוט מסגרות אשראי'),
+          { timeout: 15000 },
+        );
+        checking[0].bankCreditFacility = await readLeumiFacility(this.page);
+      } catch {
+        checking[0].bankCreditFacility = unavailableLeumiFacility();
+      }
+    } else for (const account of checking) account.bankCreditFacility = unavailableLeumiFacility();
 
     return {
       success: true,

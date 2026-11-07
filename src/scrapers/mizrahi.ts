@@ -16,6 +16,8 @@ import { getDebug } from '../helpers/debug';
 import { getRawTransaction } from '../helpers/transactions';
 import { type ScraperOptions } from './interface';
 
+import { readMizrahiFacility } from './mizrahi-credit-facility';
+
 const debug = getDebug('mizrahi');
 
 interface ScrapedTransaction {
@@ -391,11 +393,13 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const pendingTxn = await this.getPendingTransactions();
     const allTxn = oshTxnAfterStartDate.concat(pendingTxn);
+    const bankCreditFacility = await readMizrahiFacility(this.page, accountNumber);
 
     return {
       accountNumber,
       txns: allTxn,
       balance: +response.body.fields?.Yitra,
+      bankCreditFacility,
     };
   }
 
