@@ -12,6 +12,7 @@ import { type ScraperOptions, type ScraperScrapingResult } from '../interface';
 import { fetchForeignCurrencyAccounts } from './leumi-forex';
 
 import { readLeumiFacility, unavailableLeumiFacility } from './leumi-credit-facility';
+import { readLeumiLoans, unavailableLeumiLoans } from './leumi-loans';
 
 const debug = getDebug('leumi');
 const BASE_URL = 'https://hb2.bankleumi.co.il';
@@ -403,6 +404,9 @@ class LeumiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
         checking[0].bankCreditFacility = unavailableLeumiFacility();
       }
     } else for (const account of checking) account.bankCreditFacility = unavailableLeumiFacility();
+
+    if (checking.length === 1) checking[0].bankLoans = await readLeumiLoans(this.page);
+    else for (const account of checking) account.bankLoans = unavailableLeumiLoans();
 
     return {
       success: true,

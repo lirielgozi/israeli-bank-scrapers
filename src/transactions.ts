@@ -1,3 +1,16 @@
+export interface BankLoanSnapshot {
+  status: 'reported' | 'unavailable';
+  source: 'leumi-loan-summary';
+  loans: Array<{
+    sourceId: string;
+    referenceLast4: string;
+    originalAmount: number;
+    revaluedBalance: number;
+    bankAsOf: string;
+    bankEndDate: string | null;
+  }>;
+}
+
 export interface CalCardDetails {
   isDebit: boolean | null;
   billingDay: number | null;
@@ -22,6 +35,7 @@ export interface BankCreditFacility {
 }
 
 export interface TransactionsAccount {
+  bankLoans?: BankLoanSnapshot;
   calCard?: CalCardDetails;
   bankCreditFacility?: BankCreditFacility;
   accountNumber: string;
