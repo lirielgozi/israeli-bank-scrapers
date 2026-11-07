@@ -2,6 +2,8 @@ import { parseMizrahiFacility } from './mizrahi-credit-facility';
 
 // Synthetic fixture: observed labels/order, deliberately different amounts and account.
 const fixture = `מסגרת אשראי בחשבון
+אנא המתן...
+מספר חשבון
 999-123456
 לתאריך
 08/11/2026 10:15
@@ -28,6 +30,7 @@ test('reads bank labels with bank as-of; does not invent used/available or add t
 test('explicit zero is reported while missing, malformed, duplicate or wrong-account fields are unavailable', () => {
   expect(parseMizrahiFacility(fixture.replace('₪37,500.00', '₪0.00'), '999123456').limit).toBe(0);
   for (const text of [
+    fixture.replace('מספר חשבון', 'חשבון אחר'),
     fixture.replace('₪37,500.00', '—'),
     fixture.replace('₪37,500.00', '₪37,50.00'),
     fixture.replace('08/11/2026', '31/02/2026'),

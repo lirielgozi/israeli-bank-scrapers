@@ -25,7 +25,8 @@ export function parseMizrahiFacility(text: string, accountNumber: string): BankC
     const indices = lines.map((line, i) => (line === label ? i : -1)).filter(i => i >= 0);
     return indices.length === 1 ? lines[indices[0] + 1] : undefined;
   };
-  const account = valueAfter('מסגרת אשראי בחשבון');
+  if (lines.filter(line => line === 'מסגרת אשראי בחשבון').length !== 1) return unavailableFacility();
+  const account = valueAfter('מספר חשבון');
   const digits = (v: string) => v.replace(/\D/g, '');
   if (
     !account ||
