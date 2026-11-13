@@ -46,6 +46,21 @@ export interface CalCardDetails {
     nextPaymentDate: string | null;
     source: 'cal-frame-status';
   } | null;
+  // Per-card figures CAL reports even when several cards share one credit frame,
+  // which is the case where cardLevelFrames comes back empty. These are optional
+  // and omitted when absent, unlike the members above, which carry null.
+  frameUsage?: number;
+  revolvingBalance?: number;
+  cycleSpend?: number;
+  fixedDebit?: number;
+  // Rates exactly as CAL returns them, with no rounding or unit conversion.
+  interest?: {
+    nominal: number;
+    effective: number;
+    gapFromPrime: number;
+    validDate?: string;
+    kind: 'revolving';
+  };
 }
 export interface BankCreditFacility {
   status: 'reported' | 'unavailable';

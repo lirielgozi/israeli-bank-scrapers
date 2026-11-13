@@ -13,6 +13,7 @@ import {
   CardType,
   TransactionStatuses,
   TransactionTypes,
+  type CalCardDetails,
   type Transaction,
   type TransactionsAccount,
 } from '../transactions';
@@ -33,9 +34,23 @@ const LOGIN_URL = 'https://www.cal-online.co.il/';
 const TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/transactionsDetails/getCardTransactionsDetails';
 const FRAMES_REQUEST_ENDPOINT = 'https://api.cal-online.co.il/Frames/api/Frames/GetFrameStatus';
+const BIG_NUMBERS_REQUEST_ENDPOINT =
+  'https://api.cal-online.co.il/Transactions/api/financeDashboard/getBigNumberAndDetails';
+const CARD_INTERESTS_REQUEST_ENDPOINT = 'https://api.cal-online.co.il/Cards/api/interests/GetCardsInterests';
 const PENDING_TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/approvals/getClearanceRequests';
 const SSO_AUTHORIZATION_REQUEST_ENDPOINT = 'https://connect.cal-online.co.il/col-rest/calconnect/authentication/SSO';
+
+// CAL's own request bodies for the two per-card detail endpoints above were not
+// captured, so each shape below is inferred from the card-scoped bodies the other
+// endpoints use and is unverified. Both responses are matched by card id, so an
+// account-wide response is handled too and a wrong body here is a one-line fix.
+const bigNumbersRequestBody = (cardUniqueId: string) => ({ cardUniqueId });
+const cardInterestsRequestBody = (cardUniqueId: string) => ({ cardUniqueId });
+
+// The revolving credit row. Only this row may feed the revolving rate, because a
+// rate taken from any other row would silently corrupt a payoff plan.
+const REVOLVING_INTEREST_NAME = 'א.מתגלגל';
 
 const InvalidPasswordMessage = 'שם המשתמש או הסיסמה שהוזנו שגויים';
 const ChangePasswordMessage = 'להחליף סיסמה';
@@ -221,6 +236,88 @@ function isValidFramesResponse(value: unknown): value is FramesResponse {
           (frame.nextDebitDate == null || typeof frame.nextDebitDate === 'string'),
       )
     );
+  });
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+// CAL keys the card as cardUniqueId on some responses and cardUniqueID on others,
+// so accept either spelling of that one key name.
+function matchesCard(entry: Record<string, unknown>, cardUniqueId: string): boolean {
+  return Object.keys(entry).some(key => key.toLowerCase() === 'carduniqueid' && entry[key] === cardUniqueId);
+}
+
+function isSuccessResult(response: unknown): Record<string, unknown> | undefined {
+  return isRecord(response) && response.statusCode === 1 && isRecord(response.result) ? response.result : undefined;
+}
+
+type CardBigNumbers = Pick<CalCardDetails, 'revolvingBalance' | 'cycleSpend' | 'fixedDebit'>;
+
+// Any shape other than the expected one leaves every figure absent rather than throwing.
+function parseBigNumbers(response: unknown, cardUniqueId: string): CardBigNumbers {
+  const groups = isSuccessResult(response)?.bigNumbers;
+  if (!Array.isArray(groups)) return {};
+  for (const group of groups) {
+    const cards = isRecord(group) && Array.isArray(group.cards) ? group.cards : [];
+    for (const entry of cards) {
+      if (!isRecord(entry) || !matchesCard(entry, cardUniqueId) || !isRecord(entry.additionalInfo)) continue;
+      const info = entry.additionalInfo;
+      const figures: CardBigNumbers = {};
+      const revolvingBalance = finiteNumber(info.totalBasketAmount);
+      if (revolvingBalance !== undefined) figures.revolvingBalance = revolvingBalance;
+      const cycleSpend = finiteNumber(info.totalCycleTransactions);
+      if (cycleSpend !== undefined) figures.cycleSpend = cycleSpend;
+      // fixedDebitAmount is an object on a card with no fixed debit, so anything
+      // that is not a finite number counts as absent.
+      const fixedDebit = finiteNumber(info.fixedDebitAmount);
+      if (fixedDebit !== undefined) figures.fixedDebit = fixedDebit;
+      return figures;
+    }
+  }
+  return {};
+}
+
+// Only the revolving row is read. Without it the rate stays absent, so the caller
+// can ask for it by hand instead of being handed another row's rate.
+function parseCardInterest(response: unknown): CalCardDetails['interest'] {
+  const rows = isSuccessResult(response)?.cardInterests;
+  if (!Array.isArray(rows)) return undefined;
+  const row = rows.find(item => isRecord(item) && item.interestName === REVOLVING_INTEREST_NAME);
+  if (!isRecord(row)) return undefined;
+  const nominal = finiteNumber(row.nominalInterestRate),
+    effective = finiteNumber(row.effectiveInterestRate),
+    gapFromPrime = finiteNumber(row.gapFromPrime);
+  if (nominal === undefined || effective === undefined || gapFromPrime === undefined) return undefined;
+  const interest: NonNullable<CalCardDetails['interest']> = { nominal, effective, gapFromPrime, kind: 'revolving' };
+  const validDate = row.interestValidDate;
+  if (
+    typeof validDate === 'string' &&
+    /^\d{4}-\d{2}-\d{2}(?:T|$)/.test(validDate) &&
+    Number.isFinite(Date.parse(validDate))
+  )
+    interest.validDate = validDate;
+  return interest;
+}
+
+// An optional per-card detail request must never fail the scrape, so a rejected
+// request degrades to an absent body and from there to absent fields.
+async function fetchOptionalCardDetail(
+  endpoint: string,
+  body: Record<string, unknown>,
+  cardUniqueId: string,
+  Authorization: string,
+  xSiteId: string,
+): Promise<unknown> {
+  return fetchPost<unknown>(endpoint, body, {
+    Authorization,
+    'X-Site-Id': xSiteId,
+    'Content-Type': 'application/json',
+    ...apiHeaders,
+  }).catch(() => {
+    debug('optional per-card detail request failed for card %s', cardUniqueId);
+    return undefined;
   });
 }
 
@@ -619,6 +716,23 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const balanceDate: string | null | undefined = frame?.nextDebitDate;
 
+    // Two independent optional requests. Either one can fail without touching the
+    // other, the transactions below, or the rest of the card metadata.
+    const bigNumbersPromise = fetchOptionalCardDetail(
+      BIG_NUMBERS_REQUEST_ENDPOINT,
+      bigNumbersRequestBody(card.cardUniqueId),
+      card.cardUniqueId,
+      Authorization,
+      xSiteId,
+    );
+    const cardInterestsPromise = fetchOptionalCardDetail(
+      CARD_INTERESTS_REQUEST_ENDPOINT,
+      cardInterestsRequestBody(card.cardUniqueId),
+      card.cardUniqueId,
+      Authorization,
+      xSiteId,
+    );
+
     const finalMonthToFetchMoment = moment().add(futureMonthsToScrape, 'month').startOf('month');
     const months = finalMonthToFetchMoment.diff(startMoment.clone().startOf('month'), 'months');
     const allMonthsData: CardTransactionDetails[] = [];
@@ -677,15 +791,24 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         ? filterOldTransactions(transactions, moment(startDate), this.options.combineInstallments || false)
         : transactions;
 
+    const calCard = calCardDetails(card, frameResponse);
+    const [bigNumbersResponse, cardInterestsResponse] = await Promise.all([bigNumbersPromise, cardInterestsPromise]);
+    Object.assign(calCard, parseBigNumbers(bigNumbersResponse, card.cardUniqueId));
+    const interest = parseCardInterest(cardInterestsResponse);
+    if (interest !== undefined) calCard.interest = interest;
+
     const balanceAmount = frame?.nextTotalDebit;
+    // Cards sharing one credit frame have no card-level frame, so their only
+    // reported debt is the per-card frame usage. Negated like the primary value.
+    const debitAmount = balanceAmount != null ? balanceAmount : calCard.frameUsage;
 
     const result: TransactionsAccount = {
       txns,
-      balance: balanceAmount != null ? -balanceAmount : undefined,
+      balance: debitAmount != null ? -debitAmount : undefined,
       balanceDate: balanceDate != null ? balanceDate : undefined,
       accountNumber: card.last4Digits,
       cardType,
-      calCard: calCardDetails(card, frameResponse),
+      calCard,
       cardMetadataStatus: metadataUnavailable ? 'unavailable' : 'available',
       // Group limits can be shared; no card-specific limit is established by this response.
     };

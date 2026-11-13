@@ -379,3 +379,344 @@ describe('CAL synthetic card data', () => {
     expect(accounts?.[0].txns.map(txn => txn.identifier)).toEqual(['first-day']);
   });
 });
+
+// Per-card figures CAL reports for cards that share a single credit frame. Every
+// amount, rate and identifier below is invented.
+describe('CAL per-card credit figures', () => {
+  const REVOLVING = 'א.מתגלגל';
+  const invented = {
+    frameUsage: 1234.5,
+    otherUsage: 777.25,
+    revolvingBalance: 2345.67,
+    cycleSpend: 345.21,
+    fixedDebit: 400,
+    nominal: 11.111111,
+    effective: 12.345678,
+    gapFromPrime: 5.0505,
+    validDate: '2026-01-15T00:00:00',
+    decoy: 99.99,
+  };
+
+  const accountFrames = (usageByCard: Record<string, number>) =>
+    Object.entries(usageByCard).map(([cardUniqueId, frameTotalOblForCardAmount]) => ({
+      cardUniqueId,
+      frameTotalOblForCardAmount,
+    }));
+
+  const additionalInfo = (fixedDebitAmount: unknown = invented.fixedDebit) => ({
+    totalBasketAmount: invented.revolvingBalance,
+    totalCycleTransactions: invented.cycleSpend,
+    fixedDebitAmount,
+  });
+
+  const decoyInfo = { totalBasketAmount: invented.decoy, totalCycleTransactions: invented.decoy, fixedDebitAmount: 1 };
+
+  const bigNumbersBody = (
+    cardKey: 'cardUniqueId' | 'cardUniqueID' = 'cardUniqueId',
+    cardUniqueId: string = cards[0].cardUniqueId,
+    info: unknown = additionalInfo(),
+  ) => ({
+    statusCode: 1,
+    result: {
+      bigNumbers: [
+        { cards: [{ cardUniqueId: 'synthetic-unrelated', additionalInfo: decoyInfo }] },
+        { cards: [{ [cardKey]: cardUniqueId, additionalInfo: info }] },
+      ],
+    },
+  });
+
+  // Rows other than the revolving one carry a decoy rate, so picking the wrong row shows up.
+  const interestRow = (interestName: string) => {
+    const revolving = interestName === REVOLVING;
+    return {
+      interestName,
+      nominalInterestRate: revolving ? invented.nominal : invented.decoy,
+      effectiveInterestRate: revolving ? invented.effective : invented.decoy,
+      gapFromPrime: revolving ? invented.gapFromPrime : invented.decoy,
+      interestValidDate: invented.validDate,
+    };
+  };
+
+  const interestsBody = (names: string[] = ['קרדיט', REVOLVING, '+30']) => ({
+    statusCode: 1,
+    result: { cardInterests: names.map(interestRow) },
+  });
+
+  const reply = (value: unknown) => (value instanceof Error ? Promise.reject(value) : Promise.resolve(value));
+
+  function mockPerCardResponses(overrides: { frames?: unknown; bigNumbers?: unknown; interests?: unknown } = {}): void {
+    const { frames = {}, bigNumbers = null, interests = null } = overrides;
+    post.mockImplementation(endpoint => {
+      if (endpoint.includes('GetFrameStatus')) return Promise.resolve({ statusCode: 1, result: frames });
+      if (endpoint.includes('getBigNumberAndDetails')) return reply(bigNumbers);
+      if (endpoint.includes('GetCardsInterests')) return reply(interests);
+      if (endpoint.includes('getClearanceRequests')) return Promise.resolve({ statusCode: 96 });
+      return Promise.resolve({
+        statusCode: 1,
+        result: { bankAccounts: [bankAccount([transaction('synthetic-txn', '2026-02-03')])] },
+      });
+    });
+  }
+
+  beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-02-05T12:00:00Z'));
+    post.mockReset();
+    mockPerCardResponses();
+  });
+
+  afterEach(() => jest.useRealTimers());
+
+  test.each(['bankIssuedCards', 'calIssuedCards'])(
+    'reads the per-card frame usage from %s and falls back to it for the balance',
+    async issuerGroup => {
+      mockPerCardResponses({
+        frames: {
+          [issuerGroup]: {
+            frameLimitForCardAmount: 9000,
+            cardLevelFrames: [],
+            accountLevelFrames: accountFrames({
+              [cards[0].cardUniqueId]: invented.frameUsage,
+              [cards[1].cardUniqueId]: invented.otherUsage,
+            }),
+          },
+        },
+      });
+      const { accounts } = await scraper('2026-02-01').fetchData();
+      expect(accounts?.[0].calCard?.frameUsage).toBe(invented.frameUsage);
+      expect(accounts?.[0].balance).toBe(-invented.frameUsage);
+      expect(accounts?.[1].calCard?.frameUsage).toBe(invented.otherUsage);
+      expect(accounts?.[1].balance).toBe(-invented.otherUsage);
+      expect(accounts?.[2].calCard).not.toHaveProperty('frameUsage');
+      expect(accounts?.[2].balance).toBeUndefined();
+    },
+  );
+
+  test('a card level frame still decides the balance when a frame usage is also reported', async () => {
+    mockPerCardResponses({
+      frames: {
+        calIssuedCards: {
+          cardLevelFrames: [
+            { cardUniqueId: cards[0].cardUniqueId, nextTotalDebit: 50, nextDebitDate: '2026-02-10' },
+            { cardUniqueId: cards[1].cardUniqueId, nextTotalDebit: 0 },
+          ],
+          accountLevelFrames: accountFrames({
+            [cards[0].cardUniqueId]: invented.frameUsage,
+            [cards[1].cardUniqueId]: invented.otherUsage,
+          }),
+        },
+      },
+    });
+    const { accounts } = await scraper('2026-02-01').fetchData();
+    expect(accounts?.[0]).toMatchObject({ balance: -50, balanceDate: '2026-02-10' });
+    expect(accounts?.[0].calCard?.frameUsage).toBe(invented.frameUsage);
+    // A genuine zero debit is not replaced by the frame usage.
+    expect(accounts?.[1].balance).toBe(-0);
+  });
+
+  test('keeps the frame usage for a debit card the shared facility gating skips', async () => {
+    const debitCard = {
+      cardUniqueId: 'synthetic-debit',
+      last4Digits: '4444',
+      isDebitCard: true,
+      bankAccountUniqueId: 'synthetic-bank',
+      currentDebitDay: 10,
+    };
+    mockPerCardResponses({
+      frames: {
+        calIssuedCards: {
+          frameLimitForCardAmount: 9000,
+          fictiveMaxAccAmt: 500.5,
+          cardLevelFrames: [],
+          accountLevelFrames: accountFrames({ 'synthetic-debit': invented.frameUsage }),
+        },
+      },
+    });
+    const { accounts } = await scraper('2026-02-01', [debitCard]).fetchData();
+    expect(accounts?.[0].calCard?.sharedFacility).toBeNull();
+    expect(accounts?.[0].calCard?.isDebit).toBe(true);
+    expect(accounts?.[0].calCard?.frameUsage).toBe(invented.frameUsage);
+    expect(accounts?.[0].balance).toBe(-invented.frameUsage);
+  });
+
+  test('keeps the frame usage for a card listed in both issuer groups', async () => {
+    const card = {
+      cardUniqueId: 'synthetic-both',
+      last4Digits: '5555',
+      isDebitCard: false,
+      bankAccountUniqueId: 'synthetic-bank',
+      currentDebitDay: 10,
+    };
+    const group = {
+      frameLimitForCardAmount: 9000,
+      cardLevelFrames: [],
+      accountLevelFrames: accountFrames({ 'synthetic-both': invented.frameUsage }),
+    };
+    mockPerCardResponses({ frames: { bankIssuedCards: group, calIssuedCards: group } });
+    const { accounts } = await scraper('2026-02-01', [card]).fetchData();
+    expect(accounts?.[0].calCard?.sharedFacility).toBeNull();
+    expect(accounts?.[0].calCard?.frameUsage).toBe(invented.frameUsage);
+  });
+
+  test('leaves the shared facility unchanged for a card the gating accepts', async () => {
+    const card = {
+      cardUniqueId: 'synthetic-shared',
+      last4Digits: '6666',
+      isDebitCard: false,
+      bankAccountUniqueId: 'synthetic-bank',
+      currentDebitDay: 10,
+    };
+    mockPerCardResponses({
+      frames: {
+        calIssuedCards: {
+          frameLimitForCardAmount: 9000,
+          fictiveMaxAccAmt: 500.5,
+          nextTotalDebitForAccount: 1500,
+          nextTotalDebitDateForAccount: '2026-02-28',
+          cardLevelFrames: [],
+          accountLevelFrames: accountFrames({ 'synthetic-shared': invented.frameUsage }),
+        },
+      },
+    });
+    const { accounts } = await scraper('2026-02-01', [card]).fetchData();
+    expect(accounts?.[0].calCard?.sharedFacility).toMatchObject({
+      issuerGroup: 'calIssuedCards',
+      limit: 9000,
+      available: 500.5,
+      nextPayment: 1500,
+      nextPaymentDate: '2026-02-28',
+      source: 'cal-frame-status',
+    });
+    expect(accounts?.[0].calCard?.frameUsage).toBe(invented.frameUsage);
+  });
+
+  test.each(['cardUniqueId', 'cardUniqueID'] as const)(
+    'reads the revolving balance, cycle spend and fixed debit matched by %s',
+    async cardKey => {
+      mockPerCardResponses({ bigNumbers: bigNumbersBody(cardKey) });
+      const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+      expect(accounts?.[0].calCard).toMatchObject({
+        revolvingBalance: invented.revolvingBalance,
+        cycleSpend: invented.cycleSpend,
+        fixedDebit: invented.fixedDebit,
+      });
+    },
+  );
+
+  test('omits the big number figures for a card missing from the response', async () => {
+    mockPerCardResponses({ bigNumbers: bigNumbersBody('cardUniqueId', 'synthetic-other') });
+    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(accounts?.[0].calCard).not.toHaveProperty('revolvingBalance');
+    expect(accounts?.[0].calCard).not.toHaveProperty('cycleSpend');
+    expect(accounts?.[0].calCard).not.toHaveProperty('fixedDebit');
+  });
+
+  test.each([{ someFlag: true }, {}, [], null, 'none'])(
+    'treats a non numeric fixedDebitAmount (%j) as absent without losing the other figures',
+    async fixedDebitAmount => {
+      mockPerCardResponses({
+        bigNumbers: bigNumbersBody('cardUniqueId', cards[0].cardUniqueId, additionalInfo(fixedDebitAmount)),
+      });
+      const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+      expect(accounts?.[0].calCard).not.toHaveProperty('fixedDebit');
+      expect(accounts?.[0].calCard).toMatchObject({
+        revolvingBalance: invented.revolvingBalance,
+        cycleSpend: invented.cycleSpend,
+      });
+    },
+  );
+
+  test('picks the revolving row out of the other interest rows and carries the rates unrounded', async () => {
+    mockPerCardResponses({ interests: interestsBody() });
+    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(accounts?.[0].calCard?.interest).toEqual({
+      nominal: invented.nominal,
+      effective: invented.effective,
+      gapFromPrime: invented.gapFromPrime,
+      validDate: invented.validDate,
+      kind: 'revolving',
+    });
+  });
+
+  test('leaves the interest undefined when the revolving row is absent', async () => {
+    mockPerCardResponses({ interests: interestsBody(['קרדיט', '+30']) });
+    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(accounts?.[0].calCard).not.toHaveProperty('interest');
+  });
+
+  test.each([
+    ['nominalInterestRate', undefined],
+    ['effectiveInterestRate', 'invalid'],
+    ['gapFromPrime', null],
+  ])('leaves the interest undefined when %s is not a number', async (field, value) => {
+    const rows = [{ ...interestRow(REVOLVING), [field]: value }];
+    mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: rows } } });
+    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(accounts?.[0].calCard).not.toHaveProperty('interest');
+  });
+
+  test('omits only an implausible valid date and keeps the rates', async () => {
+    const rows = [{ ...interestRow(REVOLVING), interestValidDate: 'not a date' }];
+    mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: rows } } });
+    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(accounts?.[0].calCard?.interest).toEqual({
+      nominal: invented.nominal,
+      effective: invented.effective,
+      gapFromPrime: invented.gapFromPrime,
+      kind: 'revolving',
+    });
+  });
+
+  const failures: [string, unknown][] = [
+    ['a rejected request', new Error('synthetic transport failure')],
+    ['a non success status', { statusCode: 0, result: null }],
+    ['a garbage body', 'garbage'],
+    ['an absent body', undefined],
+    ['an unexpected body', { statusCode: 1, result: { bigNumbers: 'nope', cardInterests: 7 } }],
+  ];
+
+  test.each(failures)('%s from the big number call leaves only its own fields absent', async (_label, bigNumbers) => {
+    mockPerCardResponses({ bigNumbers, interests: interestsBody() });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(true);
+    expect(result.warnings).toEqual([]);
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('revolvingBalance');
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('cycleSpend');
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('fixedDebit');
+    // The independent interest call and the transactions are untouched.
+    expect(result.accounts?.[0].calCard?.interest?.nominal).toBe(invented.nominal);
+    expect(result.accounts?.[0].txns.map(txn => txn.identifier)).toEqual(['synthetic-txn']);
+  });
+
+  test.each(failures)('%s from the interest call leaves only the interest absent', async (_label, interests) => {
+    mockPerCardResponses({ bigNumbers: bigNumbersBody(), interests });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(true);
+    expect(result.warnings).toEqual([]);
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('interest');
+    expect(result.accounts?.[0].calCard).toMatchObject({
+      revolvingBalance: invented.revolvingBalance,
+      cycleSpend: invented.cycleSpend,
+      fixedDebit: invented.fixedDebit,
+    });
+    expect(result.accounts?.[0].txns.map(txn => txn.identifier)).toEqual(['synthetic-txn']);
+  });
+
+  test('both new calls failing together still returns the card and its transactions', async () => {
+    mockPerCardResponses({ bigNumbers: new Error('synthetic one'), interests: new Error('synthetic two') });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(true);
+    expect(result.accounts?.[0].calCard).toEqual({ isDebit: null, billingDay: null, sharedFacility: null });
+    expect(result.accounts?.[0].txns).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain('synthetic one');
+  });
+
+  test('requests both per-card endpoints once for every card', async () => {
+    await scraper('2026-02-01').fetchData();
+    (['getBigNumberAndDetails', 'GetCardsInterests'] as const).forEach(endpoint => {
+      const calls = post.mock.calls.filter(([url]) => url.includes(endpoint));
+      expect(calls.map(([, body]) => (body as { cardUniqueId: string }).cardUniqueId).sort()).toEqual(
+        cards.map(card => card.cardUniqueId).sort(),
+      );
+    });
+  });
+});

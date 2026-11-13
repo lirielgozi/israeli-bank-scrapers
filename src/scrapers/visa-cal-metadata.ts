@@ -10,6 +10,29 @@ function amount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+// A response that explicitly reports a non-success status carries no figures.
+// An absent statusCode is tolerated, matching the frames validation in the scraper.
+function reportsFailure(body: Record<string, unknown> | undefined): boolean {
+  return typeof body?.statusCode === 'number' && body.statusCode !== 1;
+}
+
+// On an account whose cards share one credit frame, cardLevelFrames is empty and
+// each card's own share of the frame usage is reported in accountLevelFrames.
+function accountFrameUsage(result: Record<string, unknown>, cardUniqueId: unknown): number | null {
+  if (typeof cardUniqueId !== 'string' || cardUniqueId.length === 0) return null;
+  for (const kind of ['bankIssuedCards', 'calIssuedCards'] as const) {
+    const frames = record(result[kind])?.accountLevelFrames;
+    if (!Array.isArray(frames)) continue;
+    for (const member of frames) {
+      const entry = record(member);
+      if (entry?.cardUniqueId !== cardUniqueId) continue;
+      const usage = amount(entry.frameTotalOblForCardAmount);
+      if (usage !== null) return usage;
+    }
+  }
+  return null;
+}
+
 // Observed CAL shape: accountLevelFrames contains the requested card, whereas
 // the limit/available/next-payment fields belong to its issuer/account group.
 export function calCardDetails(card: Record<string, unknown>, response: unknown): CalCardDetails {
@@ -22,6 +45,10 @@ export function calCardDetails(card: Record<string, unknown>, response: unknown)
   };
   const body = record(response),
     result = record(body?.result);
+  // Independent of the shared-facility gating below, which skips a debit card and
+  // a card that appears in more than one issuer group.
+  const frameUsage = result && !reportsFailure(body) ? accountFrameUsage(result, card.cardUniqueId) : null;
+  if (frameUsage !== null) details.frameUsage = frameUsage;
   const bankId = card.bankAccountUniqueId;
   if (
     body?.statusCode !== 1 ||
