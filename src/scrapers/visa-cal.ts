@@ -41,11 +41,11 @@ const PENDING_TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/approvals/getClearanceRequests';
 const SSO_AUTHORIZATION_REQUEST_ENDPOINT = 'https://connect.cal-online.co.il/col-rest/calconnect/authentication/SSO';
 
-// CAL's own request bodies for the two per-card detail endpoints above were not
-// captured, so each shape below is inferred from the card-scoped bodies the other
-// endpoints use and is unverified. Both responses are matched by card id, so an
-// account-wide response is handled too and a wrong body here is a one-line fix.
-const bigNumbersRequestBody = (cardUniqueId: string) => ({ cardUniqueId });
+// Both bodies below are captured from the live site. getBigNumberAndDetails is scoped
+// to a bank account and answers for every card on it, so its response is matched by
+// card id. GetCardsInterests is scoped to a single card and its response carries no
+// card id at all, so it is card-scoped by its request rather than by any field.
+const bigNumbersRequestBody = (bankAccountUniqueId: string) => ({ bankAccountUniqueId });
 const cardInterestsRequestBody = (cardUniqueId: string) => ({ cardUniqueId });
 
 // The revolving credit row. Only this row may feed the revolving rate, because a
@@ -279,12 +279,50 @@ function parseBigNumbers(response: unknown, cardUniqueId: string): CardBigNumber
   return {};
 }
 
+function isRevolvingRow(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && value.interestName === REVOLVING_INTEREST_NAME;
+}
+
+// Whether the object carries a card id key at all, in either spelling.
+function namesACard(entry: Record<string, unknown>): boolean {
+  return Object.keys(entry).some(key => key.toLowerCase() === 'carduniqueid');
+}
+
+// The interests response is one card's credit types, so the rows carry no card id and
+// are trusted because the request named a single card. A card id is honoured only
+// where a response actually carries one, on the row or on a parent holding the rows,
+// so a future account-wide shape cannot hand this card another card's rate.
+function revolvingRowsForCard(entries: unknown[], cardUniqueId: string): Record<string, unknown>[] {
+  const rows: Record<string, unknown>[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    if (isRevolvingRow(entry)) {
+      if (!namesACard(entry) || matchesCard(entry, cardUniqueId)) rows.push(entry);
+      continue;
+    }
+    if (namesACard(entry) && !matchesCard(entry, cardUniqueId)) continue;
+    for (const value of Object.values(entry)) {
+      if (!Array.isArray(value)) continue;
+      for (const nested of value)
+        if (isRevolvingRow(nested) && (!namesACard(nested) || matchesCard(nested, cardUniqueId))) rows.push(nested);
+    }
+  }
+  return rows;
+}
+
 // Only the revolving row is read. Without it the rate stays absent, so the caller
 // can ask for it by hand instead of being handed another row's rate.
-function parseCardInterest(response: unknown): CalCardDetails['interest'] {
-  const rows = isSuccessResult(response)?.cardInterests;
-  if (!Array.isArray(rows)) return undefined;
-  const row = rows.find(item => isRecord(item) && item.interestName === REVOLVING_INTEREST_NAME);
+function parseCardInterest(response: unknown, cardUniqueId: string): CalCardDetails['interest'] {
+  const entries = isSuccessResult(response)?.cardInterests;
+  if (!Array.isArray(entries)) return undefined;
+  const candidates = revolvingRowsForCard(entries, cardUniqueId);
+  // One card has one revolving row. Several of them is the signal that CAL moved to
+  // an account-wide shape, and then no row can be attributed to this card.
+  if (candidates.length > 1) {
+    debug('the card interests response looked account wide, so the revolving rate was dropped');
+    return undefined;
+  }
+  const row = candidates[0];
   if (!isRecord(row)) return undefined;
   const nominal = finiteNumber(row.nominalInterestRate),
     effective = finiteNumber(row.effectiveInterestRate),
@@ -301,12 +339,21 @@ function parseCardInterest(response: unknown): CalCardDetails['interest'] {
   return interest;
 }
 
-// An optional per-card detail request must never fail the scrape, so a rejected
-// request degrades to an absent body and from there to absent fields.
+// The init payload reports the bank account id as either a string or a number. A card
+// with anything else has no account to ask about, so it gets no request at all.
+function bankAccountKey(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.length > 0 ? value : undefined;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+// An optional detail request must never fail the scrape, so a rejected request
+// degrades to an absent body and from there to absent fields. The label only names
+// the scope of the request for the debug line and must never be an account id.
 async function fetchOptionalCardDetail(
   endpoint: string,
   body: Record<string, unknown>,
-  cardUniqueId: string,
+  label: string,
   Authorization: string,
   xSiteId: string,
 ): Promise<unknown> {
@@ -316,7 +363,7 @@ async function fetchOptionalCardDetail(
     'Content-Type': 'application/json',
     ...apiHeaders,
   }).catch(() => {
-    debug('optional per-card detail request failed for card %s', cardUniqueId);
+    debug('optional detail request failed for %s', label);
     return undefined;
   });
 }
@@ -662,6 +709,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
   private async fetchCardData(
     card: { cardUniqueId: string; last4Digits: string; [key: string]: unknown },
+    bigNumbersResponse: unknown,
     startMoment: moment.Moment,
     startDate: Date,
     futureMonthsToScrape: number,
@@ -716,15 +764,8 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const balanceDate: string | null | undefined = frame?.nextDebitDate;
 
-    // Two independent optional requests. Either one can fail without touching the
-    // other, the transactions below, or the rest of the card metadata.
-    const bigNumbersPromise = fetchOptionalCardDetail(
-      BIG_NUMBERS_REQUEST_ENDPOINT,
-      bigNumbersRequestBody(card.cardUniqueId),
-      card.cardUniqueId,
-      Authorization,
-      xSiteId,
-    );
+    // An optional request that can fail without touching the account-wide figures
+    // passed in, the transactions below, or the rest of the card metadata.
     const cardInterestsPromise = fetchOptionalCardDetail(
       CARD_INTERESTS_REQUEST_ENDPOINT,
       cardInterestsRequestBody(card.cardUniqueId),
@@ -792,9 +833,9 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         : transactions;
 
     const calCard = calCardDetails(card, frameResponse);
-    const [bigNumbersResponse, cardInterestsResponse] = await Promise.all([bigNumbersPromise, cardInterestsPromise]);
+    const cardInterestsResponse = await cardInterestsPromise;
     Object.assign(calCard, parseBigNumbers(bigNumbersResponse, card.cardUniqueId));
-    const interest = parseCardInterest(cardInterestsResponse);
+    const interest = parseCardInterest(cardInterestsResponse, card.cardUniqueId);
     if (interest !== undefined) calCard.interest = interest;
 
     const balanceAmount = frame?.nextTotalDebit;
@@ -836,12 +877,38 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const futureMonthsToScrape = this.options.futureMonthsToScrape ?? 1;
 
+    // One big-numbers response covers every card on the bank account, so ask once per
+    // distinct account rather than once per card. A failed account leaves only its own
+    // cards' figures absent, because the request degrades to an absent body.
+    const accountIds = [
+      ...new Set(
+        cards.map(card => bankAccountKey(card.bankAccountUniqueId)).filter((id): id is string => id !== undefined),
+      ),
+    ];
+    const bigNumbersByAccount = new Map<string, unknown>();
+    await Promise.all(
+      accountIds.map(async accountId => {
+        bigNumbersByAccount.set(
+          accountId,
+          await fetchOptionalCardDetail(
+            BIG_NUMBERS_REQUEST_ENDPOINT,
+            bigNumbersRequestBody(accountId),
+            'a bank account',
+            Authorization,
+            xSiteId,
+          ),
+        );
+      }),
+    );
+
     const warnings: NonNullable<ScraperScrapingResult['warnings']> = [];
     const collected = await Promise.all(
       cards.map(async card => {
+        const accountId = bankAccountKey(card.bankAccountUniqueId);
         try {
           const account = await this.fetchCardData(
             card,
+            accountId === undefined ? undefined : bigNumbersByAccount.get(accountId),
             startMoment,
             startDate,
             futureMonthsToScrape,

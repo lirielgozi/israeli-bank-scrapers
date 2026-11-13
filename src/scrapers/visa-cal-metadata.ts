@@ -10,25 +10,32 @@ function amount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-// A response that explicitly reports a non-success status carries no figures.
-// An absent statusCode is tolerated, matching the frames validation in the scraper.
+// Figures are read only from a body that reports success outright. An absent
+// statusCode is not success, matching the shared-facility gating below.
 function reportsFailure(body: Record<string, unknown> | undefined): boolean {
-  return typeof body?.statusCode === 'number' && body.statusCode !== 1;
+  return body?.statusCode !== 1;
+}
+
+function framesFor(result: Record<string, unknown>, kind: string): unknown[] | undefined {
+  const frames = record(result[kind])?.accountLevelFrames;
+  return Array.isArray(frames) ? frames : undefined;
 }
 
 // On an account whose cards share one credit frame, cardLevelFrames is empty and
-// each card's own share of the frame usage is reported in accountLevelFrames.
+// each card's own share of the frame usage is reported in accountLevelFrames. A card
+// listed in more than one issuer group has no unambiguous share, so it gets none,
+// the same refusal the shared-facility gating below makes.
 function accountFrameUsage(result: Record<string, unknown>, cardUniqueId: unknown): number | null {
   if (typeof cardUniqueId !== 'string' || cardUniqueId.length === 0) return null;
-  for (const kind of ['bankIssuedCards', 'calIssuedCards'] as const) {
-    const frames = record(result[kind])?.accountLevelFrames;
-    if (!Array.isArray(frames)) continue;
-    for (const member of frames) {
-      const entry = record(member);
-      if (entry?.cardUniqueId !== cardUniqueId) continue;
-      const usage = amount(entry.frameTotalOblForCardAmount);
-      if (usage !== null) return usage;
-    }
+  const groups = (['bankIssuedCards', 'calIssuedCards'] as const).filter(kind =>
+    framesFor(result, kind)?.some(member => record(member)?.cardUniqueId === cardUniqueId),
+  );
+  if (groups.length !== 1) return null;
+  for (const member of framesFor(result, groups[0]) ?? []) {
+    const entry = record(member);
+    if (entry?.cardUniqueId !== cardUniqueId) continue;
+    const usage = amount(entry.frameTotalOblForCardAmount);
+    if (usage !== null) return usage;
   }
   return null;
 }
