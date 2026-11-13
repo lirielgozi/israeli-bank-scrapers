@@ -244,9 +244,19 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 // CAL keys the card as cardUniqueId on some responses and cardUniqueID on others,
-// so accept either spelling of that one key name.
+// so accept either spelling of that one key name. Only a non empty string is an id, so
+// the key present with null, an empty string or a number yields no id at all. Both
+// callers below read ids from here, so such a value can neither claim to name a card
+// nor count as a mismatch, which is what would make a rate vanish without a signal.
+function cardIds(entry: Record<string, unknown>): string[] {
+  return Object.keys(entry)
+    .filter(key => key.toLowerCase() === 'carduniqueid')
+    .map(key => entry[key])
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+}
+
 function matchesCard(entry: Record<string, unknown>, cardUniqueId: string): boolean {
-  return Object.keys(entry).some(key => key.toLowerCase() === 'carduniqueid' && entry[key] === cardUniqueId);
+  return cardIds(entry).includes(cardUniqueId);
 }
 
 function isSuccessResult(response: unknown): Record<string, unknown> | undefined {
@@ -255,37 +265,54 @@ function isSuccessResult(response: unknown): Record<string, unknown> | undefined
 
 type CardBigNumbers = Pick<CalCardDetails, 'revolvingBalance' | 'cycleSpend' | 'fixedDebit'>;
 
+// The codes the result contract carries, so a card level anomaly reaches a person
+// without any consumed account or card shape having to grow a field for it.
+type ScraperWarningCode = NonNullable<ScraperScrapingResult['warnings']>[number]['code'];
+
+// One value or none, per figure. The only value every matching entry agrees on is the
+// card's, so duplicate identical entries still report their figures, and a figure the
+// entries disagree on is omitted rather than guessed from the first one found.
+function agreedFigure(infos: Record<string, unknown>[], field: string): number | undefined {
+  const values = new Set(
+    infos.map(info => finiteNumber(info[field])).filter((value): value is number => value !== undefined),
+  );
+  return values.size === 1 ? [...values][0] : undefined;
+}
+
 // Any shape other than the expected one leaves every figure absent rather than throwing.
+// The response is account wide, so several groups are the normal shape and the same card
+// can appear in more than one of them. Every matching entry is read, because a wrong
+// balance is worse than a missing one.
 function parseBigNumbers(response: unknown, cardUniqueId: string): CardBigNumbers {
   const groups = isSuccessResult(response)?.bigNumbers;
   if (!Array.isArray(groups)) return {};
+  const infos: Record<string, unknown>[] = [];
   for (const group of groups) {
     const cards = isRecord(group) && Array.isArray(group.cards) ? group.cards : [];
     for (const entry of cards) {
       if (!isRecord(entry) || !matchesCard(entry, cardUniqueId) || !isRecord(entry.additionalInfo)) continue;
-      const info = entry.additionalInfo;
-      const figures: CardBigNumbers = {};
-      const revolvingBalance = finiteNumber(info.totalBasketAmount);
-      if (revolvingBalance !== undefined) figures.revolvingBalance = revolvingBalance;
-      const cycleSpend = finiteNumber(info.totalCycleTransactions);
-      if (cycleSpend !== undefined) figures.cycleSpend = cycleSpend;
-      // fixedDebitAmount is an object on a card with no fixed debit, so anything
-      // that is not a finite number counts as absent.
-      const fixedDebit = finiteNumber(info.fixedDebitAmount);
-      if (fixedDebit !== undefined) figures.fixedDebit = fixedDebit;
-      return figures;
+      infos.push(entry.additionalInfo);
     }
   }
-  return {};
+  const figures: CardBigNumbers = {};
+  const revolvingBalance = agreedFigure(infos, 'totalBasketAmount');
+  if (revolvingBalance !== undefined) figures.revolvingBalance = revolvingBalance;
+  const cycleSpend = agreedFigure(infos, 'totalCycleTransactions');
+  if (cycleSpend !== undefined) figures.cycleSpend = cycleSpend;
+  // fixedDebitAmount is an object on a card with no fixed debit, so anything
+  // that is not a finite number counts as absent.
+  const fixedDebit = agreedFigure(infos, 'fixedDebitAmount');
+  if (fixedDebit !== undefined) figures.fixedDebit = fixedDebit;
+  return figures;
 }
 
 function isRevolvingRow(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && value.interestName === REVOLVING_INTEREST_NAME;
 }
 
-// Whether the object carries a card id key at all, in either spelling.
+// Whether the object carries a usable card id, in either spelling.
 function namesACard(entry: Record<string, unknown>): boolean {
-  return Object.keys(entry).some(key => key.toLowerCase() === 'carduniqueid');
+  return cardIds(entry).length > 0;
 }
 
 // The interests response is one card's credit types, so the rows carry no card id and
@@ -310,24 +337,32 @@ function revolvingRowsForCard(entries: unknown[], cardUniqueId: string): Record<
   return rows;
 }
 
+// An absent rate and a dropped rate are told apart, so the caller can report the
+// second one. An ambiguous response carries no interest, and a plain absence carries
+// neither, so nothing warns about a card that simply has no revolving credit.
+interface CardInterestOutcome {
+  interest?: NonNullable<CalCardDetails['interest']>;
+  ambiguous?: true;
+}
+
 // Only the revolving row is read. Without it the rate stays absent, so the caller
 // can ask for it by hand instead of being handed another row's rate.
-function parseCardInterest(response: unknown, cardUniqueId: string): CalCardDetails['interest'] {
+function parseCardInterest(response: unknown, cardUniqueId: string): CardInterestOutcome {
   const entries = isSuccessResult(response)?.cardInterests;
-  if (!Array.isArray(entries)) return undefined;
+  if (!Array.isArray(entries)) return {};
   const candidates = revolvingRowsForCard(entries, cardUniqueId);
   // One card has one revolving row. Several of them is the signal that CAL moved to
   // an account-wide shape, and then no row can be attributed to this card.
   if (candidates.length > 1) {
     debug('the card interests response looked account wide, so the revolving rate was dropped');
-    return undefined;
+    return { ambiguous: true };
   }
   const row = candidates[0];
-  if (!isRecord(row)) return undefined;
+  if (!isRecord(row)) return {};
   const nominal = finiteNumber(row.nominalInterestRate),
     effective = finiteNumber(row.effectiveInterestRate),
     gapFromPrime = finiteNumber(row.gapFromPrime);
-  if (nominal === undefined || effective === undefined || gapFromPrime === undefined) return undefined;
+  if (nominal === undefined || effective === undefined || gapFromPrime === undefined) return {};
   const interest: NonNullable<CalCardDetails['interest']> = { nominal, effective, gapFromPrime, kind: 'revolving' };
   const validDate = row.interestValidDate;
   if (
@@ -336,7 +371,7 @@ function parseCardInterest(response: unknown, cardUniqueId: string): CalCardDeta
     Number.isFinite(Date.parse(validDate))
   )
     interest.validDate = validDate;
-  return interest;
+  return { interest };
 }
 
 // The init payload reports the bank account id as either a string or a number. A card
@@ -715,6 +750,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     futureMonthsToScrape: number,
     Authorization: string,
     xSiteId: string,
+    reportWarning: (code: ScraperWarningCode) => void,
   ): Promise<TransactionsAccount> {
     debug('fetch frames (misgarot) for card %s', card.cardUniqueId);
     const frameResponse = await fetchPost<unknown>(
@@ -732,8 +768,10 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     // Observed provider response for a card without available frame data.
     // It must not abort transaction collection or masquerade as confirmed absence.
-    const metadataUnavailable =
-      isRecord(frameResponse) && typeof frameResponse.statusCode === 'number' && frameResponse.statusCode !== 1;
+    // A body that does not report success outright establishes no figure either, so an
+    // absent statusCode counts as unavailable rather than as an issuer reported blank.
+    // A body that is no record at all carries no status to read and stays malformed.
+    const metadataUnavailable = isRecord(frameResponse) && frameResponse.statusCode !== 1;
     const frames = metadataUnavailable ? { result: {} } : frameResponse;
     if (!isValidFramesResponse(frames)) {
       throw new Error('CAL card metadata response is invalid');
@@ -835,8 +873,11 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const calCard = calCardDetails(card, frameResponse);
     const cardInterestsResponse = await cardInterestsPromise;
     Object.assign(calCard, parseBigNumbers(bigNumbersResponse, card.cardUniqueId));
-    const interest = parseCardInterest(cardInterestsResponse, card.cardUniqueId);
+    const { interest, ambiguous } = parseCardInterest(cardInterestsResponse, card.cardUniqueId);
     if (interest !== undefined) calCard.interest = interest;
+    // A rate was reported and deliberately dropped, which only a warning can tell a
+    // person apart from a card that has no revolving credit at all.
+    if (ambiguous) reportWarning('interest-rate-ambiguous');
 
     const balanceAmount = frame?.nextTotalDebit;
     // Cards sharing one credit frame have no card-level frame, so their only
@@ -914,6 +955,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
             futureMonthsToScrape,
             Authorization,
             xSiteId,
+            code => warnings.push({ accountNumber: card.last4Digits, code }),
           );
           if (account.cardMetadataStatus === 'unavailable')
             warnings.push({ accountNumber: card.last4Digits, code: 'metadata-unavailable' });

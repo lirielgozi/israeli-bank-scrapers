@@ -181,7 +181,10 @@ export interface OutputDataOptions {
 }
 
 export interface ScraperScrapingResult {
-  warnings?: Array<{ accountNumber: string; code: 'metadata-unavailable' | 'card-fetch-failed' }>;
+  warnings?: Array<{
+    accountNumber: string;
+    code: 'metadata-unavailable' | 'card-fetch-failed' | 'interest-rate-ambiguous';
+  }>;
   success: boolean;
   accounts?: TransactionsAccount[];
   futureDebits?: FutureDebit[];

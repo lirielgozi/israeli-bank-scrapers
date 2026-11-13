@@ -50,9 +50,11 @@ function bankAccount(regular: unknown[] = [], immediate: unknown[] = []) {
   };
 }
 
+// The frames response reports its own success, as the live endpoint does, so these
+// bodies exercise the frame reading rather than the unavailable metadata path.
 function mockResponses(frames = {}, bankAccounts = [bankAccount()]) {
   post.mockImplementation(endpoint => {
-    if (endpoint.includes('GetFrameStatus')) return Promise.resolve({ result: frames });
+    if (endpoint.includes('GetFrameStatus')) return Promise.resolve({ statusCode: 1, result: frames });
     if (endpoint.includes('getClearanceRequests')) return Promise.resolve({ statusCode: 96 });
     return Promise.resolve({ statusCode: 1, result: { bankAccounts } });
   });
@@ -213,17 +215,22 @@ describe('CAL synthetic card data', () => {
     ]);
   });
 
+  // A body that reports success and then carries a broken shape is malformed. A body
+  // with no status at all is unavailable metadata instead, covered further down.
   test.each([
     undefined,
     null,
-    {},
-    { result: null },
-    { result: [] },
-    { result: 'invalid' },
-    { result: { bankIssuedCards: [] } },
-    { result: { calIssuedCards: { cardLevelFrames: {} } } },
-    { result: { bankIssuedCards: { cardLevelFrames: [null] } } },
-    { result: { bankIssuedCards: { cardLevelFrames: [{ cardUniqueId: 'synthetic-a', nextTotalDebit: '12' }] } } },
+    { statusCode: 1 },
+    { statusCode: 1, result: null },
+    { statusCode: 1, result: [] },
+    { statusCode: 1, result: 'invalid' },
+    { statusCode: 1, result: { bankIssuedCards: [] } },
+    { statusCode: 1, result: { calIssuedCards: { cardLevelFrames: {} } } },
+    { statusCode: 1, result: { bankIssuedCards: { cardLevelFrames: [null] } } },
+    {
+      statusCode: 1,
+      result: { bankIssuedCards: { cardLevelFrames: [{ cardUniqueId: 'synthetic-a', nextTotalDebit: '12' }] } },
+    },
   ])('isolates malformed metadata without returning an empty successful card (%j)', async response => {
     post.mockResolvedValue(response);
     const result = await scraper('2026-02-01', [cards[0]]).fetchData();
@@ -294,7 +301,9 @@ describe('CAL synthetic card data', () => {
     post.mockImplementation((endpoint, body) => {
       if (endpoint.includes('GetFrameStatus')) {
         return Promise.resolve(
-          body.cardsForFrameData[0].cardUniqueId === cards[1].cardUniqueId ? { result: null } : { result: {} },
+          body.cardsForFrameData[0].cardUniqueId === cards[1].cardUniqueId
+            ? { statusCode: 1, result: null }
+            : { statusCode: 1, result: {} },
         );
       }
       if (endpoint.includes('getClearanceRequests')) return Promise.resolve({ statusCode: 96 });
@@ -325,6 +334,30 @@ describe('CAL synthetic card data', () => {
       expect(result.warnings?.[0].code).toBe('metadata-unavailable');
     },
   );
+
+  test('a frames body with no status code is unavailable metadata, not a reported blank', async () => {
+    post.mockImplementation(endpoint =>
+      Promise.resolve(
+        endpoint.includes('GetFrameStatus')
+          ? {
+              result: {
+                bankIssuedCards: { cardLevelFrames: [{ cardUniqueId: cards[0].cardUniqueId, nextTotalDebit: 25 }] },
+              },
+            }
+          : endpoint.includes('getClearanceRequests')
+            ? { statusCode: 96 }
+            : { statusCode: 1, result: { bankAccounts: [bankAccount([transaction('synthetic-txn', '2026-02-03')])] } },
+      ),
+    );
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.success).toBe(true);
+    expect(result.accounts?.[0].cardMetadataStatus).toBe('unavailable');
+    expect(result.warnings).toEqual([{ accountNumber: cards[0].last4Digits, code: 'metadata-unavailable' }]);
+    // Nothing from such a body is reported as a figure, and the transactions still are.
+    expect(result.accounts?.[0].balance).toBeUndefined();
+    expect(result.accounts?.[0].balanceDate).toBeUndefined();
+    expect(result.accounts?.[0].txns.map(txn => txn.identifier)).toEqual(['synthetic-txn']);
+  });
 
   test('a failed transaction request omits only that card instead of returning empty rows', async () => {
     post.mockImplementation((endpoint, body) =>
@@ -616,9 +649,12 @@ describe('CAL per-card credit figures', () => {
         },
       },
     });
-    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
-    expect(accounts?.[0].calCard).not.toHaveProperty('frameUsage');
-    expect(accounts?.[0].balance).toBeUndefined();
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('frameUsage');
+    expect(result.accounts?.[0].balance).toBeUndefined();
+    // The blank is reported as unavailable metadata rather than as an issuer figure.
+    expect(result.accounts?.[0].cardMetadataStatus).toBe('unavailable');
+    expect(result.warnings).toEqual([{ accountNumber: cards[0].last4Digits, code: 'metadata-unavailable' }]);
   });
 
   test('leaves the shared facility unchanged for a card the gating accepts', async () => {
@@ -884,6 +920,48 @@ describe('CAL per-card credit figures', () => {
     expect(accounts?.[1].calCard).not.toHaveProperty('revolvingBalance');
   });
 
+  // The account wide response returns several groups, so one card can be listed twice.
+  const twoGroupsBody = (first: unknown, second: unknown) => ({
+    statusCode: 1,
+    result: {
+      bigNumbers: [
+        { cards: [{ cardUniqueId: 'synthetic-unrelated', additionalInfo: decoyInfo }] },
+        { cards: [{ cardUniqueId: cards[0].cardUniqueId, additionalInfo: first }] },
+        { cards: [{ cardUniqueId: cards[0].cardUniqueId, additionalInfo: second }] },
+      ],
+    },
+  });
+
+  test('the same card in two groups with identical figures keeps every figure', async () => {
+    mockPerCardResponses({ bigNumbers: twoGroupsBody(additionalInfo(), additionalInfo()) });
+    const { accounts } = await scraper('2026-02-01', [accountCards[0]]).fetchData();
+    expect(accounts?.[0].calCard).toMatchObject({
+      revolvingBalance: invented.revolvingBalance,
+      cycleSpend: invented.cycleSpend,
+      fixedDebit: invented.fixedDebit,
+    });
+  });
+
+  test.each([
+    ['totalBasketAmount', 'revolvingBalance'],
+    ['totalCycleTransactions', 'cycleSpend'],
+    ['fixedDebitAmount', 'fixedDebit'],
+  ] as const)('a divergent %s omits only %s and keeps the figures the groups agree on', async (field, omitted) => {
+    mockPerCardResponses({
+      bigNumbers: twoGroupsBody(additionalInfo(), { ...additionalInfo(), [field]: 1.5 }),
+    });
+    const { accounts } = await scraper('2026-02-01', [accountCards[0]]).fetchData();
+    const calCard = accounts?.[0].calCard;
+    expect(calCard).not.toHaveProperty(omitted);
+    const agreeing = {
+      revolvingBalance: invented.revolvingBalance,
+      cycleSpend: invented.cycleSpend,
+      fixedDebit: invented.fixedDebit,
+    };
+    for (const [name, value] of Object.entries(agreeing))
+      if (name !== omitted) expect(calCard).toHaveProperty(name, value);
+  });
+
   test.each(failures)(
     '%s from one bank account leaves only that account cards figures absent',
     async (_label, failed) => {
@@ -910,16 +988,75 @@ describe('CAL per-card credit figures', () => {
     },
   );
 
-  test('drops the revolving rate when the interests response carries several revolving rows', async () => {
+  test('drops the revolving rate and warns when the interests response carries several revolving rows', async () => {
     const rows = [interestRow('קרדיט'), interestRow(REVOLVING), { ...interestRow(REVOLVING), gapFromPrime: 1.25 }];
     mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: rows } } });
-    const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
-    expect(accounts?.[0].calCard).not.toHaveProperty('interest');
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('interest');
+    // The drop reaches a person rather than only the debug log.
+    expect(result.warnings).toEqual([{ accountNumber: cards[0].last4Digits, code: 'interest-rate-ambiguous' }]);
+  });
+
+  test('a response with no revolving row at all is a normal absence and warns about nothing', async () => {
+    mockPerCardResponses({ interests: interestsBody(['קרדיט', '+30']) });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('interest');
+    expect(result.warnings).toEqual([]);
   });
 
   test('keeps the rate when only other credit types sit beside one revolving row', async () => {
     mockPerCardResponses({ interests: interestsBody(['קרדיט', '+30', REVOLVING]) });
     const { accounts } = await scraper('2026-02-01', [cards[0]]).fetchData();
     expect(accounts?.[0].calCard?.interest?.nominal).toBe(invented.nominal);
+  });
+
+  // A card id key is only an id when it carries a usable one, so a blank or numeric
+  // value leaves the row card scoped instead of silently mismatching the real card.
+  test.each([
+    ['this card', cards[0].cardUniqueId],
+    ['null', null],
+    ['undefined', undefined],
+    ['an empty string', ''],
+    ['blank space', '   '],
+    ['the number zero', 0],
+    ['a number', 12],
+  ])('keeps the revolving rate when the row card id is %s', async (_label, cardUniqueId) => {
+    const rows = [{ ...interestRow(REVOLVING), cardUniqueId }];
+    mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: rows } } });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard?.interest?.nominal).toBe(invented.nominal);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test.each(['cardUniqueId', 'cardUniqueID'] as const)(
+    'excludes a revolving row whose %s names a different card',
+    async cardKey => {
+      const rows = [{ ...interestRow(REVOLVING), [cardKey]: 'synthetic-other' }];
+      mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: rows } } });
+      const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+      expect(result.accounts?.[0].calCard).not.toHaveProperty('interest');
+      expect(result.warnings).toEqual([]);
+    },
+  );
+
+  // The rows can arrive nested under a parent object instead of at the top level.
+  test.each([
+    ['names this card', cards[0].cardUniqueId],
+    ['names no card', undefined],
+  ])('reads revolving rows nested under a parent that %s', async (_label, cardUniqueId) => {
+    const parent: Record<string, unknown> = { interests: [interestRow('קרדיט'), interestRow(REVOLVING)] };
+    if (cardUniqueId !== undefined) parent.cardUniqueId = cardUniqueId;
+    mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: [parent] } } });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard?.interest?.nominal).toBe(invented.nominal);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test('ignores revolving rows nested under a parent that names a different card', async () => {
+    const parent = { cardUniqueId: 'synthetic-other', interests: [interestRow(REVOLVING)] };
+    mockPerCardResponses({ interests: { statusCode: 1, result: { cardInterests: [parent] } } });
+    const result = await scraper('2026-02-01', [cards[0]]).fetchData();
+    expect(result.accounts?.[0].calCard).not.toHaveProperty('interest');
+    expect(result.warnings).toEqual([]);
   });
 });
